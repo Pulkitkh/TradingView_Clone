@@ -124,36 +124,62 @@ async function aiExtract({ company, headline, text }) {
 // Orchestration
 // ---------------------------------------------------------------------------
 
+// Keep the first value for each field, filling only the gaps from `extra`.
+function fillGaps(base, extra) {
+  return {
+    contractValueCr: base.contractValueCr ?? extra.contractValueCr ?? null,
+    duration: base.duration ?? extra.duration ?? null,
+    customer: base.customer ?? extra.customer ?? null,
+    orderType: base.orderType ?? extra.orderType ?? null,
+  };
+}
+
 /**
- * Extract order fields. Assumes the caller already confirmed it's an order
- * (via isOrderFiling). `getPdfText` is an optional async fn used only if AI
- * fallback is needed, so we don't download PDFs we don't have to.
+ * Extract order fields with the tiered strategy. The caller has already
+ * confirmed it's an order (via isOrderFiling). `getPdfText` is an optional
+ * async fn that returns the filing's PDF text — used by the free PDF-regex
+ * tier and the AI tier, fetched at most once.
  *
  * @returns {Promise<object>} order fields (values may be null / "Not mentioned")
  */
 export async function extractOrder(filing, getPdfText) {
-  // Tier 2 first — free.
+  // Tier 2: headline regex (free).
   let fields = parseHeadline(filing);
-  let usedAi = false;
+  let by = fields.contractValueCr != null ? 'headline' : null;
+  let pdfText = filing.text || '';
+  let summary = null;
 
-  // Tier 3 — only if we still lack a value and AI is available.
-  if (client && fields.contractValueCr == null) {
+  // Tier 2.5: PDF-text regex (free) — fetch the PDF once if we still lack a
+  // value. Order filings are low-volume, so this is cheap and AI-free.
+  if (fields.contractValueCr == null && (pdfText || getPdfText)) {
+    if (!pdfText && getPdfText) pdfText = await getPdfText();
+    if (pdfText) {
+      const fromPdf = parseHeadline({ headline: '', text: pdfText });
+      // A "from X" match in dense PDF text is noisy; only trust longer names.
+      if (fromPdf.customer && fromPdf.customer.length < 5) fromPdf.customer = null;
+      fields = fillGaps(fields, fromPdf);
+      if (fromPdf.contractValueCr != null && !by) by = 'pdf-regex';
+    }
+  }
+
+  // Tier 3: AI on the PDF text — only if still missing a value AND key present.
+  if (client && fields.contractValueCr == null && pdfText) {
     try {
-      const text = filing.text || (getPdfText ? await getPdfText() : '');
-      if (text) {
-        const ai = await aiExtract({ ...filing, text });
-        usedAi = true;
-        fields = {
-          contractValueCr: ai.contractValueCr ?? fields.contractValueCr,
-          annualValueCr: ai.annualValueCr ?? ai.contractValueCr ?? fields.contractValueCr,
-          customer: ai.customer ?? fields.customer,
-          orderType: ai.orderType ?? fields.orderType,
-          duration: ai.duration ?? fields.duration,
-          summary: ai.summary,
-        };
-      }
+      const ai = await aiExtract({ ...filing, text: pdfText });
+      fields = fillGaps(
+        {
+          contractValueCr: ai.contractValueCr ?? null,
+          duration: ai.duration ?? null,
+          customer: ai.customer ?? null,
+          orderType: ai.orderType ?? null,
+        },
+        fields
+      );
+      if (ai.annualValueCr != null) fields.annualValueCr = ai.annualValueCr;
+      summary = ai.summary || null;
+      if (ai.contractValueCr != null) by = 'ai';
     } catch {
-      /* keep the headline-parsed fields */
+      /* keep the regex-parsed fields */
     }
   }
 
@@ -163,7 +189,7 @@ export async function extractOrder(filing, getPdfText) {
     contractValueCr: fields.contractValueCr ?? null,
     duration: fields.duration || 'Not mentioned',
     annualValueCr: fields.annualValueCr ?? fields.contractValueCr ?? null,
-    summary: fields.summary || filing.headline || null,
-    _extractedBy: usedAi ? 'ai' : 'headline',
+    summary: summary || filing.headline || null,
+    _extractedBy: by || 'none',
   };
 }

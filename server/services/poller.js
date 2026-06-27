@@ -35,8 +35,9 @@ async function processFiling(filing) {
   // Tier 1: classify by NSE category — no AI, no PDF download for non-orders.
   if (!isOrderFiling(filing)) return;
 
-  // Tiers 2 & 3 live in extractOrder. The PDF is fetched lazily (only if the
-  // headline lacked a value and AI fallback is enabled), via this callback.
+  // Extraction tiers live in extractOrder. The PDF is fetched lazily (only if
+  // the headline lacked a value) via this callback, and used by the free
+  // PDF-regex tier before any AI is considered.
   const getPdfText = filing.pdfUrl
     ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '')
     : null;

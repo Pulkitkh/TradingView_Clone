@@ -42,20 +42,39 @@ Company financials are sourced live from [Screener.in](https://www.screener.in).
      with zero AI and (measured on a real 5-day, 3,600-filing sample)
      **0 false positives**. Non-order filings never get a PDF download.
   2. **Headline parse (no AI):** free regex pulls value / customer / duration /
-     type from the announcement text. Covers the filings that state the value
-     inline (~1 in 6).
-  3. **AI on PDF (only if needed):** when a value is still missing *and*
-     `ANTHROPIC_API_KEY` is set, the PDF is downloaded and Claude extracts the
-     remaining fields. Most filings never reach this step.
+     type from the announcement text. Covers the ~1 in 6 filings that state the
+     value inline.
+  3. **PDF-text regex (no AI):** for filings still missing a value, download the
+     PDF and run the same regex over its text. On a real 24-filing sample this
+     lifted no-AI value coverage from **~17% to ~58%** (and recovered duration
+     for most of the rest) — all without spending a single AI token.
+  4. **AI on PDF (only if needed):** when a value is *still* missing *and*
+     `ANTHROPIC_API_KEY` is set, Claude extracts the remaining fields from the
+     PDF text. Only ~40% of filings reach this step, vs ~83% before.
 
-  Without a key, every order is still ingested — filings whose text lacked a
-  value simply show "Not mentioned" (exactly like the real site). With a key,
-  AI backfills those from the PDF.
+  Without a key, every order is still ingested — the few filings whose PDF text
+  didn't yield a value show "Not mentioned" (exactly like the real site).
 
-  > Why not skip PDFs entirely with NSE's XBRL? Measured reality: only ~17% of
-  > order filings put the value in the feed text, and NSE's order XBRL tags the
-  > value inconsistently — so the PDF is the only reliable source for the rest.
-  > That's why the value extraction is tiered rather than feed-only.
+  > **Why not skip PDFs with NSE's XBRL?** Investigated and ruled out: the
+  > announcements API doesn't expose the XBRL URL, and NSE's order XBRL tags the
+  > monetary value inconsistently. The PDF is the only reliable source — but
+  > tier 3 reads it with *regex*, so AI stays a rare fallback.
+
+#### Getting past Akamai (PDF downloads)
+
+NSE/`nsearchives` sits behind Akamai bot protection that **fingerprints the TLS
+handshake**, so a plain Node `fetch` can get `403` even with perfect headers
+(curl and real browsers pass). `services/pdf.js` therefore falls back to
+downloading through a real browser engine when fetch is blocked:
+
+- Install the optional fallback: `npm i playwright && npx playwright install chromium`
+- It activates automatically only when a download 403s; otherwise plain fetch is
+  used. If Playwright isn't installed, those filings just stay value-less.
+- Env: `PLAYWRIGHT_MODULE` (module path, default `playwright`) and
+  `PLAYWRIGHT_CHROMIUM_PATH` (browser binary) if your install is non-standard.
+
+From an India-based host you may not be fingerprint-blocked at all, in which case
+plain fetch works and the fallback never fires.
 - **Live updates:** new orders are pushed to the browser over **Server-Sent
   Events** (`/api/orders/stream`) and flash in at the top of the table.
 
@@ -97,10 +116,12 @@ real order is ingested, then flips to **LIVE**.
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | — | Enables the AI fallback (tier 3). Without it, category + headline parsing only. |
-| `EXTRACTION_MODEL` | `claude-sonnet-4-6` | Model used for extraction. |
+| `ANTHROPIC_API_KEY` | — | Enables the AI fallback (tier 4). Without it, category + headline/PDF regex only. |
+| `EXTRACTION_MODEL` | `claude-sonnet-4-6` | Model used for the AI fallback. |
 | `POLL_INTERVAL_MS` | `60000` | How often to poll the exchange feed. |
 | `DISABLE_POLLER` | `false` | Set `true` to run the API without the loop. |
+| `PLAYWRIGHT_MODULE` | `playwright` | Module path for the browser-download fallback. |
+| `PLAYWRIGHT_CHROMIUM_PATH` | — | Chromium binary path, if non-standard. |
 | `PORT` | `4000` | API port. |
 
 ## API
