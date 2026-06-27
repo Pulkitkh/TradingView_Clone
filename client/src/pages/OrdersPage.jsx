@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { fetchOrders, fetchFacets } from '../api/client.js';
+import { fetchOrders, fetchFacets, fetchStats } from '../api/client.js';
 
 const fmtCr = (v) =>
   v == null ? '—' : `₹${Number(v).toLocaleString('en-IN', { maximumFractionDigits: 1 })} Cr`;
@@ -35,12 +35,24 @@ export default function OrdersPage() {
   const [customer, setCustomer] = useState('');
   const [minOrderSize, setMinOrderSize] = useState('');
 
+  const [stats, setStats] = useState(null);
+  const [source, setSource] = useState(null);
+  const [newIds, setNewIds] = useState(() => new Set());
+  // Keep the latest filters available to the live stream without re-subscribing.
+  const filtersRef = useRef({ company: '', customer: '', minOrderSize: '' });
+
   async function load(filters = {}) {
     setLoading(true);
     setError(null);
+    filtersRef.current = {
+      company: filters.company || '',
+      customer: filters.customer || '',
+      minOrderSize: filters.minOrderSize || '',
+    };
     try {
       const data = await fetchOrders(filters);
       setOrders(data.orders);
+      setSource(data.source);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -48,9 +60,60 @@ export default function OrdersPage() {
     }
   }
 
+  // Does a live order pass the currently-applied filters?
+  function matchesFilters(o) {
+    const f = filtersRef.current;
+    if (f.company && !o.company.toLowerCase().includes(f.company.toLowerCase()))
+      return false;
+    if (
+      f.customer &&
+      !(o.customer || '').toLowerCase().includes(f.customer.toLowerCase())
+    )
+      return false;
+    if (f.minOrderSize) {
+      const min = parseFloat(f.minOrderSize);
+      if (o.orderSizePct == null || o.orderSizePct < min) return false;
+    }
+    return true;
+  }
+
   useEffect(() => {
     fetchFacets().then(setFacets).catch(() => {});
     load();
+
+    // Live pipeline status, refreshed periodically.
+    const pullStats = () => fetchStats().then(setStats).catch(() => {});
+    pullStats();
+    const statsTimer = setInterval(pullStats, 20000);
+
+    // Real-time order stream via Server-Sent Events.
+    const es = new EventSource('/api/orders/stream');
+    es.addEventListener('order', (ev) => {
+      try {
+        const order = JSON.parse(ev.data);
+        if (!matchesFilters(order)) return;
+        setSource('live');
+        setOrders((prev) => {
+          if (prev.some((o) => o.id === order.id)) return prev;
+          return [order, ...prev];
+        });
+        setNewIds((prev) => new Set(prev).add(order.id));
+        setTimeout(() => {
+          setNewIds((prev) => {
+            const next = new Set(prev);
+            next.delete(order.id);
+            return next;
+          });
+        }, 8000);
+      } catch {
+        /* ignore malformed event */
+      }
+    });
+
+    return () => {
+      clearInterval(statsTimer);
+      es.close();
+    };
   }, []);
 
   const applyFilters = () =>
@@ -80,9 +143,32 @@ export default function OrdersPage() {
       </div>
 
       <div className="page-head">
-        <h1>All Orders</h1>
+        <div className="title-row">
+          <h1>All Orders</h1>
+          {source === 'live' ? (
+            <span className="live-badge">
+              <span className="live-dot" /> LIVE
+            </span>
+          ) : (
+            <span className="live-badge sample">SAMPLE DATA</span>
+          )}
+        </div>
         <div className="page-summary">
           {orders.length} orders &middot; {fmtCr(totalValue)} total contract value
+          {stats && (
+            <>
+              {' '}&middot; {stats.source || 'NSE'} feed
+              {' '}&middot; {stats.mode === 'ai' ? 'AI extraction' : 'heuristic extraction'}
+              {stats.lastError ? (
+                <span className="stat-warn"> &middot; feed error: {stats.lastError}</span>
+              ) : stats.lastPollAt ? (
+                <span className="stat-ok">
+                  {' '}&middot; last poll{' '}
+                  {new Date(stats.lastPollAt).toLocaleTimeString()}
+                </span>
+              ) : null}
+            </>
+          )}
         </div>
       </div>
 
@@ -170,7 +256,7 @@ export default function OrdersPage() {
             )}
             {!loading &&
               orders.map((o) => (
-                <tr key={o.id}>
+                <tr key={o.id} className={newIds.has(o.id) ? 'row-new' : ''}>
                   <td>
                     <Link className="company-link" to={`/company/${o.symbol}`}>
                       {o.company}

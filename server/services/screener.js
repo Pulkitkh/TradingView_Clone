@@ -156,3 +156,25 @@ export async function getCompany(symbolOrName, consolidated = true) {
   setCached(cacheKey, data);
   return data;
 }
+
+/**
+ * Best-effort latest annual revenue (in INR crore) for a symbol, parsed from
+ * the Screener Profit & Loss "Sales" row. Returns { revenueCr, fy } or null.
+ */
+export async function getAnnualRevenue(symbolOrName) {
+  try {
+    const data = await getCompany(symbolOrName, true);
+    const pl = data.financials?.profitLoss;
+    if (!pl || !pl.rows?.length) return null;
+    const salesRow = pl.rows.find((r) => /^sales\b/i.test(r.label));
+    if (!salesRow) return null;
+    const idx = salesRow.values.length - 1;
+    const num = parseFloat(String(salesRow.values[idx]).replace(/,/g, ''));
+    if (Number.isNaN(num)) return null;
+    const fyLabel = pl.headers?.[idx] || '';
+    const fy = fyLabel ? `FY${(fyLabel.match(/\d{4}/) || [''])[0]}` : null;
+    return { revenueCr: num, fy };
+  } catch {
+    return null;
+  }
+}
