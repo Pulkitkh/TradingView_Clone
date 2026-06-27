@@ -114,6 +114,51 @@ a {
   margin: 0;
   font-weight: 700;
 }
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(46, 204, 113, 0.15);
+  color: var(--green);
+  border: 1px solid rgba(46, 204, 113, 0.35);
+}
+.live-badge.sample {
+  background: rgba(212, 160, 23, 0.12);
+  color: var(--amber);
+  border-color: rgba(212, 160, 23, 0.35);
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse 1.6s infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0.6); }
+  70% { box-shadow: 0 0 0 7px rgba(46, 204, 113, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); }
+}
+.stat-warn { color: var(--red); }
+.stat-ok { color: var(--text-dim); }
+
+.row-new {
+  animation: flashIn 8s ease-out;
+}
+@keyframes flashIn {
+  0% { background: rgba(46, 204, 113, 0.22); }
+  100% { background: transparent; }
+}
 .page-summary {
   color: var(--text-muted);
   font-size: 13px;
