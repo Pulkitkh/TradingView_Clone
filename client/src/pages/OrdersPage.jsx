@@ -158,7 +158,10 @@ export default function OrdersPage() {
           {stats && (
             <>
               {' '}&middot; {stats.source || 'NSE'} feed
-              {' '}&middot; {stats.mode === 'ai' ? 'AI extraction' : 'heuristic extraction'}
+              {' '}&middot;{' '}
+              {stats.mode === 'ai-fallback'
+                ? 'category + AI fallback'
+                : 'category + headline parse'}
               {stats.lastError ? (
                 <span className="stat-warn"> &middot; feed error: {stats.lastError}</span>
               ) : stats.lastPollAt ? (

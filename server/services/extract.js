@@ -1,11 +1,16 @@
-// Turns a raw filing (headline + PDF text) into a structured order record.
+// Turns an order filing into a structured record using a TIERED strategy that
+// keeps AI as a last resort:
 //
-// Two modes:
-//  - AI mode (preferred): if ANTHROPIC_API_KEY is set, Claude classifies the
-//    filing and extracts fields as strict JSON. This mirrors how the real
-//    product works ("extracted using AI").
-//  - Heuristic mode (fallback): keyword + regex extraction so the pipeline
-//    still runs end-to-end without an API key (lower accuracy).
+//   1. Category gate  — NSE tags order filings with a specific category, so we
+//      classify with a plain string match (no AI, no false positives).
+//   2. Headline parse — free regex over the announcement headline; fills value/
+//      customer/duration for the filings that include them in the text.
+//   3. AI on PDF      — only when a value is still missing AND ANTHROPIC_API_KEY
+//      is set. This is the only step that costs anything, and most filings
+//      never reach it.
+//
+// Without an API key the pipeline still ingests every order (with "Not
+// mentioned" where the text didn't carry a value — exactly like the real site).
 
 import Anthropic from '@anthropic-ai/sdk';
 
@@ -13,40 +18,94 @@ const MODEL = process.env.EXTRACTION_MODEL || 'claude-sonnet-4-6';
 const hasKey = !!process.env.ANTHROPIC_API_KEY;
 const client = hasKey ? new Anthropic() : null;
 
-export const extractorMode = hasKey ? 'ai' : 'heuristic';
+export const extractorMode = hasKey ? 'ai-fallback' : 'no-ai';
 
-const ORDER_KEYWORDS = [
-  'order', 'contract', 'awarded', 'award of', 'letter of award', 'loa',
-  'work order', 'bags', 'bagged', 'wins', 'secures', 'receipt of order',
-  'purchase order', 'supply order', 'tender', 'e-auction', 'work contract',
-];
+// ---------------------------------------------------------------------------
+// Tier 1: category classification (no AI)
+// ---------------------------------------------------------------------------
 
-/** Cheap pre-filter so we only spend AI calls on plausibly-order filings. */
-export function looksLikeOrder({ headline, category }) {
-  const blob = `${headline || ''} ${category || ''}`.toLowerCase();
-  return ORDER_KEYWORDS.some((k) => blob.includes(k));
+// NSE announcement categories (the `desc` field) that mean the company RECEIVED
+// an order/contract. "Awarding of order(s)/contract(s)" is the opposite side
+// and "Action(s)/orders passed" are regulatory, so both are excluded.
+const ORDER_CATEGORIES = new Set([
+  'bagging/receiving of orders/contracts',
+]);
+
+export function isOrderFiling({ category, headline }) {
+  const cat = (category || '').trim().toLowerCase();
+  if (ORDER_CATEGORIES.has(cat)) return true;
+  // Fallback for sources without a clean category: strong headline phrases.
+  return STRONG_ORDER_RE.test(headline || '');
 }
 
 // ---------------------------------------------------------------------------
-// AI extraction
+// Tier 2: headline / text regex parsing (no AI)
 // ---------------------------------------------------------------------------
 
-const SYSTEM = `You extract structured data about business orders/contracts that
-Indian listed companies disclose to the stock exchange. You are given a filing's
-headline and the text of its PDF. Decide whether the filing announces the company
-RECEIVING an order/contract/work award. Reply with ONLY a JSON object, no prose.
+const STRONG_ORDER_RE =
+  /(receipt of (?:order|letter)|letter of (?:intent|acceptance|award)|work order|purchase order|supply order|bags?\s+order|bagged\s+order|secures?\s+order|received an order|order worth|contract worth)/i;
 
-Schema:
+// "Rs. 350.5 crore", "₹1,256.30 Cr", "INR 60 crores", "Rs 4.71 Crores"
+const AMOUNT_RE =
+  /(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)\s*(crores?|cr\.?|lakhs?|millions?|mn|billions?|bn)\b/i;
+
+const ORDER_TYPE_RE =
+  /(letter of intent|letter of acceptance|letter of award|work order|purchase order|supply order|epc contract|turnkey contract|work contract|contract|order)/i;
+
+function toCrore(value, unit) {
+  const n = parseFloat(String(value).replace(/,/g, ''));
+  if (Number.isNaN(n)) return null;
+  const u = unit.toLowerCase();
+  if (u.startsWith('cr')) return n;
+  if (u.startsWith('lakh')) return n / 100;
+  if (u.startsWith('million') || u === 'mn') return n / 10;
+  if (u.startsWith('billion') || u === 'bn') return n * 100;
+  return n;
+}
+
+function titleCase(s) {
+  return s
+    .toLowerCase()
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .replace(/\bOf\b/g, 'of');
+}
+
+export function parseHeadline({ headline, text }) {
+  const blob = `${headline || ''}\n${text || ''}`;
+
+  const amt = blob.match(AMOUNT_RE);
+  const contractValueCr = amt ? toCrore(amt[1], amt[2]) : null;
+
+  const dur = blob.match(/(\d+)\s*(months?|years?|weeks?|days?)/i);
+  const duration = dur ? `${dur[1]} ${dur[2].toLowerCase()}` : null;
+
+  const cust = blob.match(
+    /from\s+((?:[A-Z][\w&.'-]*\s*){1,6}?)(?=\s+(?:for|to|towards|over|worth|valued|amounting|of|on|under|,|\.|\n|$))/
+  );
+  const customer = cust ? cust[1].trim().replace(/[.,]$/, '') : null;
+
+  const typeM = (headline || '').match(ORDER_TYPE_RE);
+  const orderType = typeM ? titleCase(typeM[1]) : null;
+
+  return { contractValueCr, duration, customer, orderType };
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: AI extraction over PDF text (only when needed)
+// ---------------------------------------------------------------------------
+
+const SYSTEM = `You extract structured data about an order/contract an Indian
+listed company disclosed to the stock exchange. You are given a headline and the
+text of the filing PDF. Reply with ONLY a JSON object, no prose:
 {
-  "isOrder": boolean,            // true only if the company received an order/contract
-  "customer": string|null,       // who placed the order (client/awarder), null if not stated
-  "orderType": string|null,      // e.g. "EPC Contract", "Supply Order", "Work Order"
-  "contractValueCr": number|null,// total order value in INR crore (convert if given in other units)
-  "duration": string|null,       // execution period if stated, e.g. "12 months"
-  "annualValueCr": number|null,  // value per year if derivable, else equal to contractValueCr for one-off
-  "summary": string|null         // one short sentence describing the order
+  "customer": string|null,        // who placed/awarded the order
+  "orderType": string|null,       // e.g. "EPC Contract", "Supply Order", "Letter of Acceptance"
+  "contractValueCr": number|null, // total order value in INR crore
+  "duration": string|null,        // execution period, e.g. "12 months"
+  "annualValueCr": number|null,   // per-year value if derivable, else same as contractValueCr
+  "summary": string|null          // one short sentence describing the order
 }
-If it is not an order filing, return {"isOrder": false} and nulls for the rest.`;
+Use null for anything not stated. Never guess a number.`;
 
 async function aiExtract({ company, headline, text }) {
   const content = `Company: ${company}\nHeadline: ${headline}\n\nPDF text (truncated):\n${(text || '').slice(0, 12000)}`;
@@ -62,80 +121,49 @@ async function aiExtract({ company, headline, text }) {
 }
 
 // ---------------------------------------------------------------------------
-// Heuristic extraction (fallback)
+// Orchestration
 // ---------------------------------------------------------------------------
 
-// Matches amounts like "Rs. 350.5 crore", "₹1,256.30 Cr", "INR 60 crores".
-const AMOUNT_RE =
-  /(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)\s*(crore|cr\.?|lakh|lakhs|million|mn|billion|bn)\b/i;
-
-function toCrore(value, unit) {
-  const n = parseFloat(String(value).replace(/,/g, ''));
-  if (Number.isNaN(n)) return null;
-  const u = unit.toLowerCase();
-  if (u.startsWith('cr')) return n;
-  if (u.startsWith('lakh')) return n / 100;
-  if (u.startsWith('million') || u === 'mn') return n / 10; // 1 mn = 0.1 cr
-  if (u.startsWith('billion') || u === 'bn') return n * 100;
-  return n;
-}
-
-// Explicit phrases that strongly indicate an order receipt (vs. a stray
-// occurrence of the word "order" in some unrelated filing).
-const STRONG_ORDER_RE =
-  /(receipt of order|award of order|awarding of order|letter of award|work order|purchase order|supply order|bags?\s+(?:an?\s+)?order|bagged\s+(?:an?\s+)?order|secures?\s+(?:an?\s+)?order|wins?\s+(?:an?\s+)?order|received\s+(?:an?\s+)?(?:order|contract)|order worth|contract worth)/i;
-
-function heuristicExtract({ headline, category, text }) {
-  const blob = `${headline || ''}\n${text || ''}`;
-  const m = blob.match(AMOUNT_RE);
-  const contractValueCr = m ? toCrore(m[1], m[2]) : null;
-
-  // In heuristic mode, only treat it as an order when there's a strong order
-  // phrase or a parseable order value — generic keyword hits are too noisy.
-  const strong =
-    STRONG_ORDER_RE.test(blob) || STRONG_ORDER_RE.test(category || '');
-  if (!strong && contractValueCr == null) return { isOrder: false };
-
-  const durMatch = blob.match(/(\d+)\s*(months?|years?|weeks?)/i);
-  const duration = durMatch ? `${durMatch[1]} ${durMatch[2].toLowerCase()}` : null;
-
-  // Capture the customer name after "from", stopping at the next clause word.
-  const custMatch = blob.match(
-    /from\s+((?:[A-Z][\w&.'-]*\s*){1,6}?)(?=\s+(?:for|to|towards|over|worth|valued|amounting|of|on|under|,|\.|\n|$))/
-  );
-  const customer = custMatch ? custMatch[1].trim().replace(/[.,]$/, '') : null;
-
-  return {
-    isOrder: true,
-    customer,
-    orderType: null,
-    contractValueCr,
-    duration,
-    annualValueCr: contractValueCr,
-    summary: (headline || '').slice(0, 160) || null,
-  };
-}
-
 /**
- * Extract an order from a filing. Returns null if it is not an order.
- * @returns {Promise<object|null>}
+ * Extract order fields. Assumes the caller already confirmed it's an order
+ * (via isOrderFiling). `getPdfText` is an optional async fn used only if AI
+ * fallback is needed, so we don't download PDFs we don't have to.
+ *
+ * @returns {Promise<object>} order fields (values may be null / "Not mentioned")
  */
-export async function extractOrder(filing) {
-  let result;
-  try {
-    result = client ? await aiExtract(filing) : heuristicExtract(filing);
-  } catch (err) {
-    // On AI failure, degrade gracefully to heuristics rather than dropping.
-    result = heuristicExtract(filing);
-    result._aiError = err.message;
+export async function extractOrder(filing, getPdfText) {
+  // Tier 2 first — free.
+  let fields = parseHeadline(filing);
+  let usedAi = false;
+
+  // Tier 3 — only if we still lack a value and AI is available.
+  if (client && fields.contractValueCr == null) {
+    try {
+      const text = filing.text || (getPdfText ? await getPdfText() : '');
+      if (text) {
+        const ai = await aiExtract({ ...filing, text });
+        usedAi = true;
+        fields = {
+          contractValueCr: ai.contractValueCr ?? fields.contractValueCr,
+          annualValueCr: ai.annualValueCr ?? ai.contractValueCr ?? fields.contractValueCr,
+          customer: ai.customer ?? fields.customer,
+          orderType: ai.orderType ?? fields.orderType,
+          duration: ai.duration ?? fields.duration,
+          summary: ai.summary,
+        };
+      }
+    } catch {
+      /* keep the headline-parsed fields */
+    }
   }
-  if (!result || !result.isOrder) return null;
+
   return {
-    customer: result.customer || 'Not mentioned',
-    orderType: result.orderType || 'Not mentioned',
-    contractValueCr: result.contractValueCr ?? null,
-    duration: result.duration || 'Not mentioned',
-    annualValueCr: result.annualValueCr ?? result.contractValueCr ?? null,
-    summary: result.summary || filing.headline || null,
+    customer: fields.customer || 'Not mentioned',
+    orderType: fields.orderType || 'Not mentioned',
+    contractValueCr: fields.contractValueCr ?? null,
+    duration: fields.duration || 'Not mentioned',
+    annualValueCr: fields.annualValueCr ?? fields.contractValueCr ?? null,
+    summary: fields.summary || filing.headline || null,
+    _extractedBy: usedAi ? 'ai' : 'headline',
   };
 }
