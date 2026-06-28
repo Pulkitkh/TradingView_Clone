@@ -12,9 +12,9 @@ Company financials are sourced live from [Screener.in](https://www.screener.in).
 
 ```
         ┌──────────────────────────┐  poll every N sec
-        │ NSE XBRL *award* feed     │  /api/XBRL-announcements?type=award
-        │ (order/contract awards    │  → already order-only, each with an
-        │  only — no classifying)   │     `xbrl` document URL
+        │ NSE XBRL feeds            │  /api/XBRL-announcements?type=para-b
+        │ para-b (live) + award     │  + ...&type=award  → keep records whose
+        │ filter eventType = order  │     eventType is an order, each w/ `xbrl`
         └────────────┬─────────────┘
                      ▼
         ┌──────────────────────────┐  fetch + parse the XBRL XML →
@@ -37,8 +37,14 @@ date, nature and execution period. So the core fields are read **directly from
 the filing — no PDF parsing and no AI.** (Endpoint + taxonomy courtesy of a
 working poller script.)
 
-- **Order-only feed:** `type=award` returns just order/contract awards, so there
-  is no "is this an order?" classification step at all.
+- **Order feeds:** NSE merged the dedicated "Awarding/Bagging of Orders" event
+  into **Para B** of Schedule III (effective 20-Jun-2026), so orders now arrive
+  in `type=para-b` mixed with other material events. We poll `para-b` (live) and
+  the legacy `award` feed, and keep only records whose **`eventType`** is an
+  order — e.g. *"Bagging/Receiving of orders/contracts (Sub-para 4-Para B)"* or
+  *"Awarding of order(s)/contract(s)"*. On a real sample this kept 40/83 para-b
+  records with **0 non-order leaks**. The order XBRL is unchanged, so the same
+  parser reads the value/customer/date.
 - **Sanity check:** a few filings mis-enter the value (wrong unit). If the XBRL
   amount is implausibly large (> ₹100,000 Cr) it's flagged ⚠ in the UI and the
   value is recovered from the free-text description when possible.

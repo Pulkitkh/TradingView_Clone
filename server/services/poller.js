@@ -9,9 +9,10 @@
 // the AI extractor on the PDF text.
 
 import {
-  fetchAwardFilings,
+  fetchOrderFilings,
   normalizeFeed,
   parseAwardXbrl,
+  cleanEventType,
 } from './nseAward.js';
 import { pdfTextFromUrl } from './pdf.js';
 import { extractOrder, extractorMode } from './extract.js';
@@ -66,7 +67,7 @@ async function processFiling(rec) {
 
   let contractValueCr = x.amountCr ?? null;
   let customer = x.counterparty || null;
-  let orderType = x.nature || null;
+  let orderType = x.nature || cleanEventType(filing.eventType) || null;
   let duration = x.duration || null;
   const flag = x.flag || null;
 
@@ -137,7 +138,7 @@ async function pollOnce() {
   stats.polls++;
   stats.lastPollAt = new Date().toISOString();
   try {
-    const feed = await fetchAwardFilings();
+    const feed = await fetchOrderFilings();
 
     if (firstRun) {
       // Baseline the existing backlog without alert spam, but DO ingest them
@@ -159,7 +160,7 @@ async function pollOnce() {
 export function getStats() {
   return {
     ...stats,
-    source: 'NSE XBRL award feed',
+    source: 'NSE XBRL para-b + award',
     mode: extractorMode === 'ai-fallback' ? 'xbrl + ai-fallback' : 'xbrl (structured)',
     telegram: telegramEnabled,
     pollIntervalMs: POLL_MS,
