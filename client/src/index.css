@@ -151,6 +151,7 @@ a {
 }
 .stat-warn { color: var(--red); }
 .stat-ok { color: var(--text-dim); }
+.flag-warn { color: var(--amber); cursor: help; }
 
 .row-new {
   animation: flashIn 8s ease-out;
