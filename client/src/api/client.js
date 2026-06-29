@@ -28,6 +28,10 @@ export function fetchFacets() {
   return getJson(`${BASE}/orders/facets`);
 }
 
+export function fetchStats() {
+  return getJson(`${BASE}/orders/stats`);
+}
+
 export function fetchCompany(symbol, consolidated = true) {
   return getJson(
     `${BASE}/company/${encodeURIComponent(symbol)}?consolidated=${consolidated}`
