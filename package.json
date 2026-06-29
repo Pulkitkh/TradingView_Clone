@@ -1,0 +1,15 @@
+{
+  "name": "company-data-clone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A clone of FinanciallyFree's order-tracking tool with company financial data sourced from Screener.in",
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "install:all": "npm install && npm install --prefix server && npm install --prefix client",
+    "build": "npm run build --prefix client",
+    "start": "npm run start --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
