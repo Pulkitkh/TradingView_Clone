@@ -10,9 +10,22 @@
 
 import { fetchJson, fetchText } from './browserFetch.js';
 
-const FEED_URL =
-  'https://www.nseindia.com/api/XBRL-announcements?index=equities&type=award';
+// NSE merged the dedicated "award" event into Para B of Schedule III effective
+// 20-Jun-2026, so orders now arrive in the `para-b` feed (mixed with other
+// material events) and must be filtered by eventType. We poll both: `para-b`
+// is the live source going forward; `award` still covers pre-merge filings.
+const FEED = (type) =>
+  `https://www.nseindia.com/api/XBRL-announcements?index=equities&type=${type}`;
+const FEED_TYPES = ['para-b', 'award'];
 const WARMUP = 'https://www.nseindia.com/';
+
+// eventType strings that denote an order/contract award in the Para B feed,
+// e.g. "Bagging/Receiving of orders/contracts (Sub-para 4-Para B)" or
+// "Awarding of order(s)/contract(s)-(Sub-para 4-Para B)".
+const ORDER_EVENT_RE = /\b(order|contract|bagging|awarding)\b/i;
+export function isOrderEvent(eventType) {
+  return ORDER_EVENT_RE.test(eventType || '');
+}
 
 // Absurd values usually mean a filing data-entry error (wrong unit). Flag,
 // don't trust, and try to recover from the free-text description.
@@ -51,20 +64,48 @@ async function warmup() {
   }
 }
 
-/** Fetch the list of award filings (newest first). */
-export async function fetchAwardFilings() {
+/**
+ * Fetch order/contract award filings across the para-b + award feeds, filtered
+ * to orders and deduped by appId (newest first). Para B records are filtered by
+ * eventType; the legacy award feed is order-only by definition.
+ */
+export async function fetchOrderFilings() {
   await warmup();
-  const data = await fetchJson(FEED_URL, {
-    cookie,
-    headers: {
-      Accept: '*/*',
-      Referer:
-        'https://www.nseindia.com/companies-listing/corporate-filings-announcements',
-    },
-  });
-  if (!Array.isArray(data)) throw new Error('award feed: unexpected payload');
-  return data;
+  const headers = {
+    Accept: '*/*',
+    Referer:
+      'https://www.nseindia.com/companies-listing/corporate-filings-announcements',
+  };
+
+  const seen = new Set();
+  const out = [];
+  const errors = [];
+  for (const type of FEED_TYPES) {
+    let data;
+    try {
+      data = await fetchJson(FEED(type), { cookie, headers });
+    } catch (err) {
+      errors.push(`${type}: ${err.message}`);
+      continue; // one feed failing shouldn't kill the other
+    }
+    if (!Array.isArray(data)) continue;
+    for (const rec of data) {
+      // award feed is already order-only; para-b must be filtered by eventType.
+      if (type !== 'award' && !isOrderEvent(rec.eventType)) continue;
+      const id = String(rec.appId);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(rec);
+    }
+  }
+  if (!out.length && errors.length) {
+    throw new Error(`order feeds failed — ${errors.join('; ')}`);
+  }
+  return out;
 }
+
+// Back-compat alias.
+export const fetchAwardFilings = fetchOrderFilings;
 
 function decodeEntities(s) {
   return s
@@ -156,5 +197,12 @@ export function normalizeFeed(rec) {
     xbrlUrl: rec.xbrl || null,
     pdfUrl: rec.attachment || null,
     broadcastDateTime: rec.broadcastDateTime || null,
+    eventType: rec.eventType || null,
   };
+}
+
+/** "Awarding of order(s)/contract(s)-(Sub-para 4-Para B)" -> clean type. */
+export function cleanEventType(eventType) {
+  if (!eventType) return null;
+  return eventType.replace(/\s*[-(]?\s*\(?Sub-para[^)]*\)?\s*$/i, '').trim() || null;
 }
