@@ -136,9 +136,9 @@ export default function OrdersPage() {
       <div className="warning-banner">
         <span className="warn-icon">⚠</span>
         <span>
-          <strong>Important:</strong> Order details are extracted using AI and may
-          contain errors. Please verify the information by checking the PDF
-          documents before making any business decisions.
+          <strong>Important:</strong> Order details come from companies' own NSE
+          XBRL filings and may contain data-entry errors. Please verify against
+          the source PDF before making any business decisions.
         </span>
       </div>
 
@@ -157,11 +157,9 @@ export default function OrdersPage() {
           {orders.length} orders &middot; {fmtCr(totalValue)} total contract value
           {stats && (
             <>
-              {' '}&middot; {stats.source || 'NSE'} feed
-              {' '}&middot;{' '}
-              {stats.mode === 'ai-fallback'
-                ? 'category + regex + AI fallback'
-                : 'category + headline/PDF regex'}
+              {' '}&middot; {stats.source || 'NSE'}
+              {' '}&middot; {stats.mode}
+              {stats.telegram ? ' · telegram on' : ''}
               {stats.lastError ? (
                 <span className="stat-warn"> &middot; feed error: {stats.lastError}</span>
               ) : stats.lastPollAt ? (
@@ -274,6 +272,9 @@ export default function OrdersPage() {
                   <td>{fmtDate(o.date)}</td>
                   <td className={contractValueClass(o.contractValueCr)}>
                     {fmtCr(o.contractValueCr)}
+                    {o._flag && (
+                      <span className="flag-warn" title={o._flag}> ⚠</span>
+                    )}
                   </td>
                   <td className={o.duration === 'Not mentioned' ? 'muted' : ''}>
                     {o.duration}
