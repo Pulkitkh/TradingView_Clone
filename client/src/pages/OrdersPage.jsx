@@ -160,8 +160,8 @@ export default function OrdersPage() {
               {' '}&middot; {stats.source || 'NSE'} feed
               {' '}&middot;{' '}
               {stats.mode === 'ai-fallback'
-                ? 'category + AI fallback'
-                : 'category + headline parse'}
+                ? 'category + regex + AI fallback'
+                : 'category + headline/PDF regex'}
               {stats.lastError ? (
                 <span className="stat-warn"> &middot; feed error: {stats.lastError}</span>
               ) : stats.lastPollAt ? (
