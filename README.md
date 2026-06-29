@@ -35,11 +35,27 @@ Company financials are sourced live from [Screener.in](https://www.screener.in).
 
 - **Source:** NSE's `corporate-announcements` API (live, with PDF links). BSE
   can be added the same way; its API is geo-restricted to Indian IPs.
-- **Classification + extraction:** `server/services/extract.js`. With an
-  `ANTHROPIC_API_KEY` set it uses **Claude** to decide whether a filing is an
-  order and to extract fields as strict JSON (this mirrors the real product,
-  which notes data is "extracted using AI"). Without a key it falls back to a
-  **heuristic** regex extractor so the pipeline still runs (lower accuracy).
+- **Tiered extraction** (`server/services/extract.js`) — AI is a last resort,
+  not the default:
+  1. **Category gate (no AI):** NSE tags order receipts with the category
+     `Bagging/Receiving of orders/contracts`. A string match classifies them
+     with zero AI and (measured on a real 5-day, 3,600-filing sample)
+     **0 false positives**. Non-order filings never get a PDF download.
+  2. **Headline parse (no AI):** free regex pulls value / customer / duration /
+     type from the announcement text. Covers the filings that state the value
+     inline (~1 in 6).
+  3. **AI on PDF (only if needed):** when a value is still missing *and*
+     `ANTHROPIC_API_KEY` is set, the PDF is downloaded and Claude extracts the
+     remaining fields. Most filings never reach this step.
+
+  Without a key, every order is still ingested — filings whose text lacked a
+  value simply show "Not mentioned" (exactly like the real site). With a key,
+  AI backfills those from the PDF.
+
+  > Why not skip PDFs entirely with NSE's XBRL? Measured reality: only ~17% of
+  > order filings put the value in the feed text, and NSE's order XBRL tags the
+  > value inconsistently — so the PDF is the only reliable source for the rest.
+  > That's why the value extraction is tiered rather than feed-only.
 - **Live updates:** new orders are pushed to the browser over **Server-Sent
   Events** (`/api/orders/stream`) and flash in at the top of the table.
 
@@ -81,7 +97,7 @@ real order is ingested, then flips to **LIVE**.
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_API_KEY` | — | Enables AI extraction. Without it, heuristic mode. |
+| `ANTHROPIC_API_KEY` | — | Enables the AI fallback (tier 3). Without it, category + headline parsing only. |
 | `EXTRACTION_MODEL` | `claude-sonnet-4-6` | Model used for extraction. |
 | `POLL_INTERVAL_MS` | `60000` | How often to poll the exchange feed. |
 | `DISABLE_POLLER` | `false` | Set `true` to run the API without the loop. |

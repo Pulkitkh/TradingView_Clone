@@ -4,7 +4,7 @@
 
 import { fetchAnnouncements, normalize } from './nse.js';
 import { pdfTextFromUrl } from './pdf.js';
-import { extractOrder, looksLikeOrder, extractorMode } from './extract.js';
+import { extractOrder, isOrderFiling, extractorMode } from './extract.js';
 import { getAnnualRevenue } from './screener.js';
 import * as store from './orderStore.js';
 
@@ -32,25 +32,23 @@ async function processFiling(filing) {
   processed.add(filing.id);
   stats.filingsSeen++;
 
-  // Cheap pre-filter on headline/category before doing any heavy work.
-  if (!looksLikeOrder(filing)) return;
+  // Tier 1: classify by NSE category — no AI, no PDF download for non-orders.
+  if (!isOrderFiling(filing)) return;
 
-  let text = '';
-  if (filing.pdfUrl) {
-    try {
-      text = await pdfTextFromUrl(filing.pdfUrl);
-    } catch {
-      /* scanned/blocked PDF — fall back to headline only */
-    }
-  }
+  // Tiers 2 & 3 live in extractOrder. The PDF is fetched lazily (only if the
+  // headline lacked a value and AI fallback is enabled), via this callback.
+  const getPdfText = filing.pdfUrl
+    ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '')
+    : null;
 
-  const extracted = await extractOrder({
-    company: filing.company,
-    headline: filing.headline,
-    category: filing.category,
-    text,
-  });
-  if (!extracted) return; // not actually an order
+  const extracted = await extractOrder(
+    {
+      company: filing.company,
+      headline: filing.headline,
+      category: filing.category,
+    },
+    getPdfText
+  );
 
   // Enrich with annual revenue to compute order size %.
   let companyRevenueCr = null;
@@ -82,6 +80,7 @@ async function processFiling(filing) {
     revenueFy,
     pdfUrl: filing.pdfUrl,
     summary: extracted.summary,
+    extractedBy: extracted._extractedBy,
     source: 'NSE',
   };
 
