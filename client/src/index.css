@@ -152,6 +152,18 @@ a {
 .stat-warn { color: var(--red); }
 .stat-ok { color: var(--text-dim); }
 .flag-warn { color: var(--amber); cursor: help; }
+.src-tag {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+.src-nse { background: rgba(59, 130, 246, 0.15); color: var(--accent-2); }
+.src-bse { background: rgba(212, 160, 23, 0.15); color: var(--amber); }
 
 .row-new {
   animation: flashIn 8s ease-out;

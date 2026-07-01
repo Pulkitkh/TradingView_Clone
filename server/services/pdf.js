@@ -1,82 +1,12 @@
-// Downloads a filing PDF and extracts its text layer.
-//
-// NSE/nsearchives sits behind Akamai bot protection that fingerprints the TLS
-// handshake, so a plain Node `fetch` can get 403 even with perfect headers.
-// When that happens we optionally fall back to fetching through a real browser
-// engine (Playwright/Chromium), whose fingerprint passes. The browser fallback
-// is OPTIONAL: if `playwright` isn't installed we just use fetch.
-//
-// Some filings are scanned images with no text layer — those return little/no
-// text, and the value simply stays "Not mentioned" (or, with an API key, the
-// AI tier can read the PDF).
+// Downloads a filing PDF (with the shared Akamai-aware browser fallback) and
+// extracts its text layer. Some filings are scanned images with no text layer —
+// those return little/no text and the value simply stays unknown.
 
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
-
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-
-// Lazily-created shared browser request context (only if Playwright is present).
-let browserCtxPromise = null;
-
-async function getBrowserContext() {
-  if (browserCtxPromise) return browserCtxPromise;
-  browserCtxPromise = (async () => {
-    let chromium;
-    try {
-      // PLAYWRIGHT_MODULE lets you point at a non-default install location.
-      const mod = process.env.PLAYWRIGHT_MODULE || 'playwright';
-      ({ chromium } = await import(mod));
-    } catch {
-      return null; // Playwright not installed — fallback disabled.
-    }
-    const launchOpts = {};
-    if (process.env.PLAYWRIGHT_CHROMIUM_PATH) {
-      launchOpts.executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH;
-    }
-    try {
-      const browser = await chromium.launch(launchOpts);
-      return browser.newContext({ userAgent: UA });
-    } catch {
-      return null;
-    }
-  })();
-  return browserCtxPromise;
-}
-
-async function fetchViaBrowser(url) {
-  const ctx = await getBrowserContext();
-  if (!ctx) return null;
-  try {
-    const res = await ctx.request.get(url, {
-      headers: { Referer: 'https://www.nseindia.com/' },
-      timeout: 30000,
-    });
-    if (!res.ok()) return null;
-    return Buffer.from(await res.body());
-  } catch {
-    return null;
-  }
-}
+import { fetchBuffer } from './browserFetch.js';
 
 export async function downloadPdf(url) {
-  // 1) Plain fetch — fast, works when not fingerprint-blocked.
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': UA, Referer: 'https://www.nseindia.com/' },
-    });
-    if (res.ok) return Buffer.from(await res.arrayBuffer());
-    if (res.status !== 403) throw new Error(`PDF download failed ${res.status}`);
-  } catch (err) {
-    if (!/403/.test(err.message)) {
-      // network error — still try the browser fallback before giving up
-    }
-  }
-
-  // 2) Browser fallback for Akamai-fingerprinted 403s.
-  const viaBrowser = await fetchViaBrowser(url);
-  if (viaBrowser) return viaBrowser;
-
-  throw new Error('PDF download failed (403; browser fallback unavailable)');
+  return fetchBuffer(url);
 }
 
 export async function extractText(buffer) {
