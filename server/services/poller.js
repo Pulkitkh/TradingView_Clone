@@ -1,19 +1,19 @@
-// The "forever loop": polls NSE's XBRL *award* feed (order/contract awards
-// only), reads each order's structured XBRL — value, customer, date, duration,
-// nature — enriches it with company revenue, and pushes it into the store
-// (newest-first). No PDF parsing or AI is needed for the core fields; the
-// award XBRL provides them directly.
+// The "forever loop": polls NSE (structured XBRL) and BSE (headline/PDF regex)
+// for new order/contract wins, enriches each with company revenue, dedupes
+// across exchanges, and pushes them into the store (newest-first). SSE + optional
+// Telegram fan them out.
 //
-// Tiered value recovery (rare): if the XBRL amount is blank/suspect, fall back
-// to a free regex over the filing's description, then — only if a key is set —
-// the AI extractor on the PDF text.
+// NSE path: value/customer/date come straight from the award XBRL — no AI.
+// BSE path: BSE has no structured value, so we extract via the regex tier
+//   (headline → PDF text), with optional AI only if a key is set.
 
 import {
-  fetchOrderFilings,
+  fetchOrderFilings as fetchNseOrders,
   normalizeFeed,
   parseAwardXbrl,
   cleanEventType,
 } from './nseAward.js';
+import { fetchOrderFilings as fetchBseOrders } from './bse.js';
 import { pdfTextFromUrl } from './pdf.js';
 import { extractOrder, extractorMode } from './extract.js';
 import { getAnnualRevenue } from './screener.js';
@@ -21,7 +21,10 @@ import { sendOrderAlert, telegramEnabled } from './telegram.js';
 import * as store from './orderStore.js';
 
 const POLL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000);
-const processed = new Set(); // appIds already evaluated
+const BSE_ENABLED = process.env.DISABLE_BSE !== 'true';
+
+const processed = new Set(); // filing IDs already evaluated (either exchange)
+const dupeKeys = new Set(); // cross-exchange dedupe: company|value|day
 let running = false;
 let firstRun = true;
 let stats = {
@@ -30,6 +33,7 @@ let stats = {
   ordersFound: 0,
   lastPollAt: null,
   lastError: null,
+  bySource: { NSE: 0, BSE: 0 },
 };
 
 const MONTHS = {
@@ -37,11 +41,11 @@ const MONTHS = {
   jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
 };
 
-// NSE timestamps are in IST. We return an ISO string carrying the +05:30
-// offset so the calendar date never drifts when the browser renders it.
+// Exchange timestamps are IST. Return an ISO string carrying the +05:30 offset
+// so the calendar date never drifts when the browser renders it.
 function parseDate(s) {
   if (!s) return new Date().toISOString();
-  // NSE broadcast/announcement format "24-Jun-2026 13:26:00" (IST).
+  // NSE broadcast "24-Jun-2026 13:26:00" (IST).
   const m = String(s).match(/(\d{1,2})-(\w{3})-(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);
   if (m) {
     const [, d, mon, y, hh = '00', mm = '00', ss = '00'] = m;
@@ -49,19 +53,85 @@ function parseDate(s) {
     const dd = String(+d).padStart(2, '0');
     return `${y}-${mo}-${dd}T${hh.padStart(2, '0')}:${mm}:${ss}+05:30`;
   }
-  // ISO date from XBRL ("2026-06-24") — pin to IST midnight, no drift.
-  const iso = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}T00:00:00+05:30`;
+  // ISO date/datetime ("2026-06-24" or "2026-07-01T14:38:37", BSE) — treat as IST.
+  const iso = String(s).match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2}))?/);
+  if (iso) {
+    const [, y, mo, d, hh = '00', mm = '00', ss = '00'] = iso;
+    return `${y}-${mo}-${d}T${hh}:${mm}:${ss}+05:30`;
+  }
   return new Date().toISOString();
 }
 
-async function processFiling(rec) {
-  const filing = normalizeFeed(rec);
-  if (processed.has(filing.id) || store.has(filing.id)) return;
-  processed.add(filing.id);
+// Shared tail: enrich a candidate with revenue, dedupe, store, alert.
+// candidate: { id, source, symbol, company, customer, orderType, contractValueCr,
+//              duration, date, awardDate, pdfUrl, summary, flag }
+async function enrichAndStore(c) {
+  if (processed.has(c.id) || store.has(c.id)) return;
+  processed.add(c.id);
   stats.filingsSeen++;
 
-  // Primary: structured fields straight from the award XBRL.
+  // Cross-exchange dedupe: the same order is often filed on both NSE and BSE.
+  if (c.contractValueCr != null) {
+    const key = `${c.company.toLowerCase().replace(/\s+/g, ' ').trim()}|${c.contractValueCr}|${String(c.date).slice(0, 10)}`;
+    if (dupeKeys.has(key)) return;
+    dupeKeys.add(key);
+  }
+
+  // Enrich with annual revenue → Order Size %. NSE gives a ticker; BSE gives a
+  // name — Screener resolves both.
+  let companyRevenueCr = null;
+  let revenueFy = null;
+  const lookup = c.symbol || c.company;
+  if (lookup) {
+    const rev = await getAnnualRevenue(lookup);
+    if (rev) {
+      companyRevenueCr = rev.revenueCr;
+      revenueFy = rev.fy;
+    }
+  }
+  const orderSizePct =
+    c.contractValueCr && companyRevenueCr
+      ? +((c.contractValueCr / companyRevenueCr) * 100).toFixed(2)
+      : null;
+
+  const order = {
+    id: c.id,
+    company: c.company,
+    symbol: c.symbol || null,
+    // used by the UI to link to Screener (ticker if we have it, else name)
+    screenerQuery: c.symbol || c.company,
+    customer: c.customer || 'Not mentioned',
+    orderType: c.orderType || 'Not mentioned',
+    date: c.date,
+    awardDate: c.awardDate || null,
+    contractValueCr: c.contractValueCr ?? null,
+    duration: c.duration || 'Not mentioned',
+    annualValueCr: c.contractValueCr ?? null,
+    orderSizePct,
+    companyRevenueCr,
+    revenueFy,
+    pdfUrl: c.pdfUrl || null,
+    summary: c.summary || null,
+    source: c.source,
+    _flag: c.flag || null,
+  };
+
+  const added = await store.add(order);
+  if (added) {
+    stats.ordersFound++;
+    stats.bySource[c.source] = (stats.bySource[c.source] || 0) + 1;
+    console.log(
+      `[order] (${c.source}) ${order.company} — ${order.contractValueCr ?? '?'} Cr — ${order.customer}`
+    );
+    await sendOrderAlert(order);
+  }
+}
+
+// ---- NSE: structured XBRL ----
+async function processNse(rec) {
+  const filing = normalizeFeed(rec);
+  if (processed.has(filing.id) || store.has(filing.id)) return;
+
   let x = {};
   if (filing.xbrlUrl) {
     try {
@@ -75,103 +145,102 @@ async function processFiling(rec) {
   let customer = x.counterparty || null;
   let orderType = x.nature || cleanEventType(filing.eventType) || null;
   let duration = x.duration || null;
-  const flag = x.flag || null;
 
-  // Fallback only if the XBRL didn't give a value: free regex over the
-  // description, then optional AI on the PDF.
   if (contractValueCr == null) {
-    const getPdf = filing.pdfUrl
-      ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '')
-      : null;
-    const extracted = await extractOrder(
-      {
-        company: filing.company,
-        headline: x.description || x.nature || '',
-        category: 'award',
-        text: '',
-      },
+    const getPdf = filing.pdfUrl ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '') : null;
+    const ex = await extractOrder(
+      { company: filing.company, headline: x.description || x.nature || '', category: 'award', text: '' },
       getPdf
     );
-    contractValueCr = extracted.contractValueCr;
-    customer = customer || (extracted.customer !== 'Not mentioned' ? extracted.customer : null);
-    orderType = orderType || (extracted.orderType !== 'Not mentioned' ? extracted.orderType : null);
-    duration = duration || (extracted.duration !== 'Not mentioned' ? extracted.duration : null);
+    contractValueCr = ex.contractValueCr;
+    customer = customer || (ex.customer !== 'Not mentioned' ? ex.customer : null);
+    orderType = orderType || (ex.orderType !== 'Not mentioned' ? ex.orderType : null);
+    duration = duration || (ex.duration !== 'Not mentioned' ? ex.duration : null);
   }
 
-  // Enrich with annual revenue to compute order size %.
-  let companyRevenueCr = null;
-  let revenueFy = null;
-  if (filing.symbol) {
-    const rev = await getAnnualRevenue(filing.symbol);
-    if (rev) {
-      companyRevenueCr = rev.revenueCr;
-      revenueFy = rev.fy;
-    }
-  }
-  const orderSizePct =
-    contractValueCr && companyRevenueCr
-      ? +((contractValueCr / companyRevenueCr) * 100).toFixed(2)
-      : null;
-
-  const order = {
+  await enrichAndStore({
     id: filing.id,
-    company: filing.company,
+    source: 'NSE',
     symbol: filing.symbol,
-    customer: customer || 'Not mentioned',
-    orderType: orderType || 'Not mentioned',
-    // "Date" = when the market learned of it (announcement/dissemination),
-    // matching how the exchanges and comparable trackers show it. The XBRL
-    // order-received date is kept separately.
+    company: filing.company,
+    customer,
+    orderType,
+    contractValueCr,
+    duration,
     date: parseDate(filing.broadcastDateTime || x.date),
     awardDate: x.date ? parseDate(x.date) : null,
-    contractValueCr,
-    duration: duration || 'Not mentioned',
-    annualValueCr: contractValueCr,
-    orderSizePct,
-    companyRevenueCr,
-    revenueFy,
     pdfUrl: filing.pdfUrl,
     summary: x.nature || x.description || null,
-    source: 'NSE-XBRL',
-    _flag: flag,
-  };
+    flag: x.flag || null,
+  });
+}
 
-  const added = await store.add(order);
-  if (added) {
-    stats.ordersFound++;
-    console.log(`[order] ${order.company} — ${order.contractValueCr ?? '?'} Cr — ${order.customer}`);
-    await sendOrderAlert(order);
-  }
+// ---- BSE: headline/PDF regex ----
+async function processBse(filing) {
+  if (processed.has(filing.id) || store.has(filing.id)) return;
+  const getPdf = filing.pdfUrl ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '') : null;
+  const ex = await extractOrder(
+    { company: filing.company, headline: filing.headline, category: filing.category, text: '' },
+    getPdf
+  );
+  await enrichAndStore({
+    id: filing.id,
+    source: 'BSE',
+    symbol: null,
+    company: filing.company,
+    customer: ex.customer !== 'Not mentioned' ? ex.customer : null,
+    orderType: ex.orderType !== 'Not mentioned' ? ex.orderType : null,
+    contractValueCr: ex.contractValueCr,
+    duration: ex.duration !== 'Not mentioned' ? ex.duration : null,
+    date: parseDate(filing.broadcastDateTime),
+    pdfUrl: filing.pdfUrl,
+    summary: ex.summary || filing.headline || null,
+    flag: null,
+  });
 }
 
 async function pollOnce() {
   stats.polls++;
   stats.lastPollAt = new Date().toISOString();
-  try {
-    const feed = await fetchOrderFilings();
+  const errors = [];
 
-    if (firstRun) {
-      // Baseline the existing backlog without alert spam, but DO ingest them
-      // so the dashboard isn't empty on first boot.
-      firstRun = false;
-      for (const rec of [...feed].reverse()) await processFiling(rec);
-      console.log(`[poller] baselined ${stats.ordersFound} existing orders`);
-    } else {
-      const fresh = feed.filter((r) => !processed.has(String(r.appId)));
-      for (const rec of fresh.reverse()) await processFiling(rec);
+  // NSE
+  try {
+    const nse = await fetchNseOrders();
+    for (const rec of [...nse].reverse()) {
+      if (!firstRun && processed.has(String(rec.appId))) continue;
+      await processNse(rec);
     }
-    stats.lastError = null;
   } catch (err) {
-    stats.lastError = err.message;
-    console.warn('[poller] poll failed:', err.message);
+    errors.push(`NSE: ${err.message}`);
   }
+
+  // BSE (optional)
+  if (BSE_ENABLED) {
+    try {
+      const bse = await fetchBseOrders();
+      for (const filing of [...bse].reverse()) {
+        if (!firstRun && processed.has(filing.id)) continue;
+        await processBse(filing);
+      }
+    } catch (err) {
+      errors.push(`BSE: ${err.message}`);
+    }
+  }
+
+  if (firstRun) {
+    firstRun = false;
+    console.log(`[poller] baselined ${stats.ordersFound} existing orders (NSE+BSE)`);
+  }
+  stats.lastError = errors.length ? errors.join(' | ') : null;
+  if (errors.length) console.warn('[poller] poll issues:', stats.lastError);
 }
 
 export function getStats() {
   return {
     ...stats,
-    source: 'NSE XBRL para-b + award',
-    mode: extractorMode === 'ai-fallback' ? 'xbrl + ai-fallback' : 'xbrl (structured)',
+    source: BSE_ENABLED ? 'NSE (XBRL) + BSE' : 'NSE (XBRL)',
+    mode: extractorMode === 'ai-fallback' ? 'xbrl + regex + ai-fallback' : 'xbrl + regex',
     telegram: telegramEnabled,
     pollIntervalMs: POLL_MS,
     running,
@@ -182,7 +251,7 @@ export function startPoller() {
   if (running) return;
   running = true;
   console.log(
-    `[poller] starting — NSE XBRL award feed, interval ${POLL_MS}ms, telegram:${telegramEnabled}`
+    `[poller] starting — NSE${BSE_ENABLED ? ' + BSE' : ''}, interval ${POLL_MS}ms, telegram:${telegramEnabled}`
   );
   const loop = async () => {
     if (!running) return;

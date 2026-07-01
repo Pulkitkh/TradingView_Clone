@@ -260,9 +260,17 @@ export default function OrdersPage() {
               orders.map((o) => (
                 <tr key={o.id} className={newIds.has(o.id) ? 'row-new' : ''}>
                   <td>
-                    <Link className="company-link" to={`/company/${o.symbol}`}>
+                    <Link
+                      className="company-link"
+                      to={`/company/${encodeURIComponent(o.screenerQuery || o.symbol || o.company)}`}
+                    >
                       {o.company}
                     </Link>
+                    {o.source && (
+                      <span className={`src-tag src-${o.source.toLowerCase()}`}>
+                        {o.source}
+                      </span>
+                    )}
                   </td>
                   <td className={o.customer === 'Not mentioned' ? 'muted' : ''}>
                     {o.customer}
