@@ -10,6 +10,7 @@ const fmtDate = (iso) =>
     day: '2-digit',
     month: 'short',
     year: 'numeric',
+    timeZone: 'Asia/Kolkata',
   });
 
 function orderSizeClass(pct) {

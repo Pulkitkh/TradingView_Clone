@@ -37,16 +37,22 @@ const MONTHS = {
   jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
 };
 
+// NSE timestamps are in IST. We return an ISO string carrying the +05:30
+// offset so the calendar date never drifts when the browser renders it.
 function parseDate(s) {
   if (!s) return new Date().toISOString();
-  // ISO date from XBRL ("2026-06-24") …
-  const iso = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return new Date(`${s}T00:00:00Z`).toISOString();
-  // … or NSE broadcast format "24-Jun-2026 13:26:00".
+  // NSE broadcast/announcement format "24-Jun-2026 13:26:00" (IST).
   const m = String(s).match(/(\d{1,2})-(\w{3})-(\d{4})(?:\s+(\d{2}):(\d{2}):(\d{2}))?/);
-  if (!m) return new Date().toISOString();
-  const [, d, mon, y, hh = '0', mm = '0', ss = '0'] = m;
-  return new Date(Date.UTC(+y, MONTHS[mon.toLowerCase()] ?? 0, +d, +hh, +mm, +ss)).toISOString();
+  if (m) {
+    const [, d, mon, y, hh = '00', mm = '00', ss = '00'] = m;
+    const mo = String((MONTHS[mon.toLowerCase()] ?? 0) + 1).padStart(2, '0');
+    const dd = String(+d).padStart(2, '0');
+    return `${y}-${mo}-${dd}T${hh.padStart(2, '0')}:${mm}:${ss}+05:30`;
+  }
+  // ISO date from XBRL ("2026-06-24") — pin to IST midnight, no drift.
+  const iso = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}T00:00:00+05:30`;
+  return new Date().toISOString();
 }
 
 async function processFiling(rec) {
@@ -113,7 +119,11 @@ async function processFiling(rec) {
     symbol: filing.symbol,
     customer: customer || 'Not mentioned',
     orderType: orderType || 'Not mentioned',
-    date: parseDate(x.date || filing.broadcastDateTime),
+    // "Date" = when the market learned of it (announcement/dissemination),
+    // matching how the exchanges and comparable trackers show it. The XBRL
+    // order-received date is kept separately.
+    date: parseDate(filing.broadcastDateTime || x.date),
+    awardDate: x.date ? parseDate(x.date) : null,
     contractValueCr,
     duration: duration || 'Not mentioned',
     annualValueCr: contractValueCr,
