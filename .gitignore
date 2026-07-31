@@ -6,3 +6,5 @@ dist/
 .DS_Store
 client/dist/
 server/data/live-orders.json
+logs/
+server/.env

@@ -6,8 +6,11 @@
   "scripts": {
     "dev": "concurrently -n server,client -c blue,green \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
     "install:all": "npm install && npm install --prefix server && npm install --prefix client",
-    "build": "npm run build --prefix client",
-    "start": "npm run start --prefix server"
+    "build": "cd client && npm run build",
+    "start": "npm run start --prefix server",
+    "setup:prod": "npm run install:all && npm --prefix server exec playwright install chromium && npm run build",
+    "start:prod": "node --env-file=server/.env server/index.js",
+    "deploy": "git pull && npm run setup:prod && pm2 restart trendingdata"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"
