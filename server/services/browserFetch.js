@@ -82,6 +82,10 @@ async function getContext() {
     if (process.env.PLAYWRIGHT_CHROMIUM_PATH) {
       launchOpts.executablePath = process.env.PLAYWRIGHT_CHROMIUM_PATH;
     }
+    // Node's fetch honours HTTPS_PROXY automatically; Chromium does not, so a
+    // proxied environment would leave the browser unable to connect at all.
+    const proxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+    if (proxy) launchOpts.proxy = { server: proxy };
     try {
       const browser = await chromium.launch(launchOpts);
       return await browser.newContext({ userAgent: UA });
@@ -220,7 +224,12 @@ async function fetchAny(url, { headers = {}, cookie } = {}, binary) {
       return out;
     }
   } catch (err) {
-    if (!/-> \d+$/.test(err.message)) throw err; // network error, not a block
+    // A real HTTP status (404, 500…) means the request got through and the
+    // browser won't do better — surface it. Anything else is a transport-level
+    // failure: Akamai commonly blocks by RESETTING the connection rather than
+    // answering 403, which surfaces as a bare "fetch failed". Those must fall
+    // through to the browser fallback, not abort.
+    if (/-> \d+$/.test(err.message)) throw err;
   }
 
   const viaB = await viaBrowser(url, { binary });
