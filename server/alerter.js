@@ -369,6 +369,52 @@ async function pollOnce() {
   await dedupe.save();
 }
 
+// --test           : post a test message, confirm token/chat/admin rights, exit
+// --send-recent=N  : post the N most recent orders now, ignoring de-dupe, exit
+//                    (proves the whole pipeline end to end)
+async function runOneShot(mode, n) {
+  if (mode === 'test') {
+    console.log('[alerter] sending test message…');
+    await sendMessage(
+      '✅ <b>Order alerter connected</b>\n' +
+        '<i>If you can see this, the bot, token and group are set up correctly.</i>\n\n' +
+        'Real alerts will arrive here as soon as a company files a new order with NSE or BSE.'
+    );
+    console.log('[alerter] ✅ sent. Check your Telegram group.');
+    return;
+  }
+
+  console.log(`[alerter] fetching the ${n} most recent orders…`);
+  await dedupe.init();
+  const collected = [];
+  try {
+    collected.push(...(await collectNse()));
+  } catch (err) {
+    console.warn('[alerter] NSE:', err.message);
+  }
+  if (BSE_ENABLED) {
+    try {
+      collected.push(...(await collectBse()));
+    } catch (err) {
+      console.warn('[alerter] BSE:', err.message);
+    }
+  }
+  collected.sort((a, b) => new Date(b.date) - new Date(a.date)); // newest first
+  const batch = collected.slice(0, n).reverse(); // post oldest-first
+  if (!batch.length) {
+    console.log('[alerter] no orders found to send (feeds returned nothing new).');
+    return;
+  }
+  for (const raw of batch) {
+    const o = await enrich(raw);
+    await sendMessage(formatAlert(o));
+    dedupe.markAlerted(o); // so the live loop won't repeat them
+    console.log(`[sent] (${o.source}) ${o.company} — ${o.contractValueCr ?? '?'} Cr`);
+  }
+  await dedupe.save();
+  console.log(`[alerter] ✅ sent ${batch.length}. Check your Telegram group.`);
+}
+
 async function main() {
   const loaded = await dedupe.init();
   console.log(
@@ -411,8 +457,17 @@ if (isEntry) {
     });
   }
 
-  main().catch((err) => {
-    console.error('[alerter] fatal:', err);
+  const argv = process.argv.slice(2);
+  const recentArg = argv.find((a) => a.startsWith('--send-recent'));
+  const oneShot = argv.includes('--test')
+    ? { mode: 'test' }
+    : recentArg
+      ? { mode: 'recent', n: Number(recentArg.split('=')[1] || 3) }
+      : null;
+
+  const run = oneShot ? runOneShot(oneShot.mode, oneShot.n) : main();
+  run.catch((err) => {
+    console.error('[alerter] fatal:', err.message || err);
     process.exit(1);
   });
 }

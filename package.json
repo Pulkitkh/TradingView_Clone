@@ -11,6 +11,8 @@
     "setup:prod": "npm run install:all && npm --prefix server exec playwright install chromium && npm run build",
     "start:prod": "node --env-file=server/.env server/index.js",
     "alert": "node --env-file=server/.env server/alerter.js",
+    "alert:test": "node --env-file=server/.env server/alerter.js --test",
+    "alert:recent": "node --env-file=server/.env server/alerter.js --send-recent=3",
     "deploy": "git pull && npm run setup:prod && pm2 restart trendingdata"
   },
   "devDependencies": {
