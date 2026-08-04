@@ -164,14 +164,21 @@ function parseDate(s) {
 
 // ---------- collect orders from both exchanges ----------
 
-async function collectNse() {
+// `limit` + `ignoreDedupe` exist for --send-recent, which deliberately re-posts
+// the newest N filings even though they are already recorded.
+async function collectNse({ ignoreDedupe = false, limit = 0 } = {}) {
   const out = [];
-  const feed = await fetchNseOrders();
+  let feed = await fetchNseOrders();
+  if (limit > 0) {
+    // Feed is newest-first; only parse what we actually need.
+    feed = feed.slice(0, limit);
+  }
   for (const rec of feed) {
     const filing = normalizeFeed(rec);
     // Cheap id check BEFORE fetching the XBRL — avoids re-downloading documents
     // for filings we've already alerted on.
-    if (dedupe.alreadyAlerted({ id: filing.id, company: filing.company })) continue;
+    if (!ignoreDedupe && dedupe.alreadyAlerted({ id: filing.id, company: filing.company }))
+      continue;
 
     let x = {};
     if (filing.xbrlUrl) {
@@ -216,11 +223,13 @@ async function collectNse() {
   return out;
 }
 
-async function collectBse() {
+async function collectBse({ ignoreDedupe = false, limit = 0 } = {}) {
   const out = [];
-  const feed = await fetchBseOrders();
+  let feed = await fetchBseOrders();
+  if (limit > 0) feed = feed.slice(0, limit);
   for (const filing of feed) {
-    if (dedupe.alreadyAlerted({ id: filing.id, company: filing.company })) continue;
+    if (!ignoreDedupe && dedupe.alreadyAlerted({ id: filing.id, company: filing.company }))
+      continue;
     const getPdf = filing.pdfUrl ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '') : null;
     const ex = await extractOrder(
       { company: filing.company, headline: filing.headline, category: filing.category, text: '' },
@@ -386,15 +395,18 @@ async function runOneShot(mode, n) {
 
   console.log(`[alerter] fetching the ${n} most recent orders…`);
   await dedupe.init();
+  // Deliberately ignore de-dupe here: this mode exists to prove the pipeline,
+  // so it re-posts the newest N even though they are already recorded.
+  const opts = { ignoreDedupe: true, limit: n };
   const collected = [];
   try {
-    collected.push(...(await collectNse()));
+    collected.push(...(await collectNse(opts)));
   } catch (err) {
     console.warn('[alerter] NSE:', err.message);
   }
   if (BSE_ENABLED) {
     try {
-      collected.push(...(await collectBse()));
+      collected.push(...(await collectBse(opts)));
     } catch (err) {
       console.warn('[alerter] BSE:', err.message);
     }
