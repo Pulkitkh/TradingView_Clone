@@ -1,33 +1,81 @@
 // Fetches a URL, falling back to a real browser engine when a plain Node
-// `fetch` is blocked by TLS-fingerprint bot protection (NSE/Akamai 403s
-// undici but lets curl/browsers through).
+// `fetch` is blocked by TLS-fingerprint bot protection (both NSE and BSE sit
+// behind Akamai, which 403s undici but lets real browsers through).
 //
-// Two browser strategies, picked by host:
-//  - www.nseindia.com API calls: run fetch INSIDE a navigated page
-//    (page.evaluate) so it's a genuine same-origin XHR — this is how the real
-//    site loads its data and what gets past Akamai.
-//  - nsearchives.nseindia.com (XBRL/PDF): use the browser request context,
-//    which that (more lenient) host accepts.
+// Strategy: keep a warmed browser page PER SITE (nseindia / bseindia). For an
+// API/JSON URL we run the fetch INSIDE that site's page (page.evaluate) so it
+// is a genuine browser XHR carrying that site's Akamai cookies — which is how
+// the real site loads its own data. Binary files (PDF/XBRL archives) are opened
+// as a top-level navigation instead.
 //
-// The browser fallback is OPTIONAL: without `playwright` it's a no-op and we
-// just return the plain-fetch result. From a non-fingerprinted host plain
-// fetch works and the browser never launches.
+// Requests are throttled and, when a site starts refusing us, put in a short
+// cooldown — hammering a rate-limited exchange only extends the block.
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-const NSE_PAGE =
-  'https://www.nseindia.com/companies-listing/corporate-filings-announcements';
 
-let sessionPromise = null; // { ctx, page } or null
+const SITE_HOME = {
+  nse: 'https://www.nseindia.com/companies-listing/corporate-filings-announcements',
+  bse: 'https://www.bseindia.com/corporates/ann.html',
+};
 
-async function getSession() {
-  if (sessionPromise) return sessionPromise;
-  sessionPromise = (async () => {
+function siteFor(url) {
+  if (/nseindia\.com/i.test(url)) return 'nse';
+  if (/bseindia\.com/i.test(url)) return 'bse';
+  return null;
+}
+
+// ---- pacing & cooldown ------------------------------------------------------
+
+const MIN_GAP_MS = Number(process.env.FETCH_GAP_MS || 600);
+const COOLDOWN_MS = Number(process.env.FETCH_COOLDOWN_MS || 120_000);
+let lastFetchAt = 0;
+const blockedUntil = {}; // site -> timestamp
+
+async function pace() {
+  const wait = lastFetchAt + MIN_GAP_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastFetchAt = Date.now();
+}
+
+function inCooldown(site) {
+  return site && blockedUntil[site] && Date.now() < blockedUntil[site];
+}
+
+function startCooldown(site) {
+  if (!site) return;
+  if (!inCooldown(site)) {
+    blockedUntil[site] = Date.now() + COOLDOWN_MS;
+    console.warn(
+      `[fetch] ${site.toUpperCase()} is refusing requests — pausing ${Math.round(
+        COOLDOWN_MS / 1000
+      )}s before retrying (rate limit).`
+    );
+  }
+}
+
+function clearCooldown(site) {
+  if (site) delete blockedUntil[site];
+}
+
+// ---- browser fallback -------------------------------------------------------
+
+let ctxPromise = null;
+let browserUnavailableReason = null;
+let warnedUnavailable = false;
+const sitePages = {}; // site -> Promise<page>
+
+async function getContext() {
+  if (ctxPromise) return ctxPromise;
+  ctxPromise = (async () => {
     let chromium;
     try {
       const mod = process.env.PLAYWRIGHT_MODULE || 'playwright';
       ({ chromium } = await import(mod));
-    } catch {
+    } catch (err) {
+      browserUnavailableReason =
+        'playwright is not installed. Run:  npm --prefix server install  ' +
+        '&&  npm --prefix server exec playwright install chromium';
       return null;
     }
     const launchOpts = {};
@@ -36,98 +84,167 @@ async function getSession() {
     }
     try {
       const browser = await chromium.launch(launchOpts);
-      const ctx = await browser.newContext({ userAgent: UA });
-      const page = await ctx.newPage();
-      try {
-        await page.goto(NSE_PAGE, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await page.waitForTimeout(2500); // let Akamai's challenge settle
-      } catch {
-        /* still usable for nsearchives */
-      }
-      return { ctx, page };
-    } catch {
+      return await browser.newContext({ userAgent: UA });
+    } catch (err) {
+      browserUnavailableReason =
+        `Chromium failed to launch (${err.message.split('\n')[0]}). Run:  ` +
+        'npm --prefix server exec playwright install chromium';
       return null;
     }
   })();
-  return sessionPromise;
+  return ctxPromise;
 }
 
-function isSameOriginApi(url) {
-  return /^https:\/\/www\.nseindia\.com\//i.test(url);
+function warnUnavailableOnce() {
+  if (warnedUnavailable || !browserUnavailableReason) return;
+  warnedUnavailable = true;
+  console.error(
+    `\n[fetch] ⚠️  Browser fallback is NOT available — ${browserUnavailableReason}\n` +
+      '        Without it, the exchanges will block this machine as soon as they rate-limit ' +
+      'plain requests.\n'
+  );
 }
 
-async function viaBrowser(url, { binary = false } = {}) {
-  const session = await getSession();
-  if (!session) return null;
-  const { ctx, page } = session;
-
-  // Same-origin NSE API → fetch from inside the page.
-  if (isSameOriginApi(url) && !binary) {
+// A page already navigated to the site, so Akamai's challenge has run and its
+// cookies are set. Reused across calls.
+async function getSitePage(site) {
+  if (sitePages[site]) return sitePages[site];
+  sitePages[site] = (async () => {
+    const ctx = await getContext();
+    if (!ctx) return null;
+    const page = await ctx.newPage();
     try {
-      const body = await page.evaluate(async (u) => {
-        const r = await fetch(u, {
-          headers: { Accept: '*/*' },
-          credentials: 'include',
-        });
-        if (!r.ok) return null;
-        return r.text();
-      }, url);
-      if (body != null) return body;
+      await page.goto(SITE_HOME[site] || 'https://example.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000,
+      });
+      await page.waitForTimeout(2500); // let the bot challenge settle
     } catch {
-      /* fall through to request context */
+      /* still usable for top-level navigations */
     }
-  }
+    return page;
+  })();
+  return sitePages[site];
+}
 
-  // Cross-origin archive host (nsearchives XBRL/PDF) → open as a top-level
-  // navigation in its own page, which Akamai accepts as a real browser hit.
-  const archivePage = await ctx.newPage();
+async function inPageFetchOnce(site, url) {
+  const page = await getSitePage(site);
+  if (!page) return null;
   try {
-    const resp = await archivePage.goto(url, { waitUntil: 'commit', timeout: 30000 });
+    return await page.evaluate(async (u) => {
+      const r = await fetch(u, { headers: { Accept: '*/*' }, credentials: 'include' });
+      return r.ok ? r.text() : null;
+    }, url);
+  } catch {
+    return null;
+  }
+}
+
+// In-page fetch with one re-warm: the exchanges' cookies expire, so on failure
+// we discard the cached page, re-navigate for fresh cookies, and retry once.
+async function inPageFetch(site, url) {
+  let body = await inPageFetchOnce(site, url);
+  if (body != null) return body;
+
+  const stale = sitePages[site];
+  try {
+    const p = await stale;
+    if (p) await p.close().catch(() => {});
+  } catch {
+    /* ignore */
+  }
+  if (sitePages[site] === stale) delete sitePages[site];
+
+  return inPageFetchOnce(site, url);
+}
+
+async function topLevelFetch(url, binary) {
+  const ctx = await getContext();
+  if (!ctx) return null;
+  const site = siteFor(url);
+  if (site) await getSitePage(site); // warm cookies first
+  const page = await ctx.newPage();
+  try {
+    const resp = await page.goto(url, { waitUntil: 'commit', timeout: 30000 });
     if (!resp || !resp.ok()) return null;
     const buf = await resp.body();
     return binary ? buf : buf.toString('utf8');
   } catch {
     return null;
   } finally {
-    await archivePage.close().catch(() => {});
+    await page.close().catch(() => {});
   }
 }
+
+async function viaBrowser(url, { binary = false } = {}) {
+  await pace();
+  const site = siteFor(url);
+  if (!binary && site) {
+    const body = await inPageFetch(site, url);
+    if (body != null) return body;
+  }
+  return topLevelFetch(url, binary);
+}
+
+// ---- public API -------------------------------------------------------------
 
 async function plainFetch(url, headers, binary) {
   const res = await fetch(url, { headers });
   if (res.ok) return binary ? Buffer.from(await res.arrayBuffer()) : res.text();
-  if (res.status !== 403) throw new Error(`fetch ${url} -> ${res.status}`);
-  return undefined; // 403 → signal caller to try browser
-}
-
-export async function fetchText(url, { headers = {}, cookie } = {}) {
-  const h = { 'User-Agent': UA, Referer: 'https://www.nseindia.com/', ...headers };
-  if (cookie) h.Cookie = cookie;
-  try {
-    const out = await plainFetch(url, h, false);
-    if (out !== undefined) return out;
-  } catch {
-    /* fall through */
+  if (res.status !== 403 && res.status !== 429) {
+    throw new Error(`fetch ${url} -> ${res.status}`);
   }
-  const viaB = await viaBrowser(url, { binary: false });
-  if (viaB != null) return viaB;
-  throw new Error(`fetch failed (403; browser fallback unavailable): ${url}`);
+  return undefined; // blocked → try the browser
 }
 
-export async function fetchJson(url, opts) {
+async function fetchAny(url, { headers = {}, cookie } = {}, binary) {
+  const site = siteFor(url);
+  if (inCooldown(site)) {
+    const secs = Math.ceil((blockedUntil[site] - Date.now()) / 1000);
+    throw new Error(`${site} rate-limited, cooling down ${secs}s: ${url}`);
+  }
+
+  const h = {
+    'User-Agent': UA,
+    Accept: '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    Referer: site === 'bse' ? 'https://www.bseindia.com/' : 'https://www.nseindia.com/',
+    ...headers,
+  };
+  if (cookie) h.Cookie = cookie;
+
+  try {
+    const out = await plainFetch(url, h, binary);
+    if (out !== undefined) {
+      clearCooldown(site);
+      return out;
+    }
+  } catch (err) {
+    if (!/-> \d+$/.test(err.message)) throw err; // network error, not a block
+  }
+
+  const viaB = await viaBrowser(url, { binary });
+  if (viaB != null) {
+    clearCooldown(site);
+    return viaB;
+  }
+
+  warnUnavailableOnce();
+  startCooldown(site);
+  const why = browserUnavailableReason
+    ? `browser fallback unavailable — ${browserUnavailableReason}`
+    : 'blocked in both plain and browser fetch (rate limited)';
+  throw new Error(`fetch failed (403; ${why}): ${url}`);
+}
+
+export async function fetchText(url, opts = {}) {
+  return fetchAny(url, opts, false);
+}
+
+export async function fetchJson(url, opts = {}) {
   return JSON.parse(await fetchText(url, opts));
 }
 
-export async function fetchBuffer(url, { headers = {}, cookie } = {}) {
-  const h = { 'User-Agent': UA, Referer: 'https://www.nseindia.com/', ...headers };
-  if (cookie) h.Cookie = cookie;
-  try {
-    const out = await plainFetch(url, h, true);
-    if (out !== undefined) return out;
-  } catch {
-    /* fall through */
-  }
-  const viaB = await viaBrowser(url, { binary: true });
-  if (viaB != null) return viaB;
-  throw new Error(`fetch failed (403; browser fallback unavailable): ${url}`);
+export async function fetchBuffer(url, opts = {}) {
+  return fetchAny(url, opts, true);
 }
