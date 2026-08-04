@@ -10,6 +10,7 @@
     "start": "npm run start --prefix server",
     "setup:prod": "npm run install:all && npm --prefix server exec playwright install chromium && npm run build",
     "start:prod": "node --env-file=server/.env server/index.js",
+    "alert": "node --env-file=server/.env server/alerter.js",
     "deploy": "git pull && npm run setup:prod && pm2 restart trendingdata"
   },
   "devDependencies": {

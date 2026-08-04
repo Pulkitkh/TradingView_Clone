@@ -8,3 +8,4 @@ client/dist/
 server/data/live-orders.json
 logs/
 server/.env
+server/data/alerted.json

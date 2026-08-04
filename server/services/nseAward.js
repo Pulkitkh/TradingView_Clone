@@ -11,20 +11,24 @@
 import { fetchJson, fetchText } from './browserFetch.js';
 
 // NSE merged the dedicated "award" event into Para B of Schedule III effective
-// 20-Jun-2026, so orders now arrive in the `para-b` feed (mixed with other
-// material events) and must be filtered by eventType. We poll both: `para-b`
-// is the live source going forward; `award` still covers pre-merge filings.
+// 20-Jun-2026. The legacy `type=award` feed now returns 0 records (verified
+// live), so `para-b` is the only source — orders arrive mixed with other
+// material events and are selected by eventType.
 const FEED = (type) =>
   `https://www.nseindia.com/api/XBRL-announcements?index=equities&type=${type}`;
-const FEED_TYPES = ['para-b', 'award'];
+const FEED_TYPES = ['para-b'];
 const WARMUP = 'https://www.nseindia.com/';
 
-// eventType strings that denote an order/contract award in the Para B feed,
-// e.g. "Bagging/Receiving of orders/contracts (Sub-para 4-Para B)" or
-// "Awarding of order(s)/contract(s)-(Sub-para 4-Para B)".
+// eventType strings that denote a NEW order/contract win in the Para B feed:
+//   "Bagging/Receiving of orders/contracts (Sub-para 4-Para B)"
+//   "Awarding of order(s)/contract(s)-(Sub-para 4-Para B)"
+// "Amendment or termination of orders/contracts" shares Sub-para 4 but is a
+// change/cancellation, not a new win, so it is excluded.
 const ORDER_EVENT_RE = /\b(order|contract|bagging|awarding)\b/i;
+const NOT_NEW_ORDER_RE = /amendment|termination|terminated|cancell?ation/i;
 export function isOrderEvent(eventType) {
-  return ORDER_EVENT_RE.test(eventType || '');
+  const t = eventType || '';
+  return ORDER_EVENT_RE.test(t) && !NOT_NEW_ORDER_RE.test(t);
 }
 
 // Absurd values usually mean a filing data-entry error (wrong unit). Flag,
@@ -90,8 +94,8 @@ export async function fetchOrderFilings() {
     }
     if (!Array.isArray(data)) continue;
     for (const rec of data) {
-      // award feed is already order-only; para-b must be filtered by eventType.
-      if (type !== 'award' && !isOrderEvent(rec.eventType)) continue;
+      // para-b carries all material events; keep only new order/contract wins.
+      if (!isOrderEvent(rec.eventType)) continue;
       const id = String(rec.appId);
       if (seen.has(id)) continue;
       seen.add(id);
