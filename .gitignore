@@ -1,11 +1,11 @@
-node_modules/
-dist/
-.env
-.env.local
 *.log
 .DS_Store
+.env
+.env.local
 client/dist/
-server/data/live-orders.json
+dist/
 logs/
+node_modules/
 server/.env
 server/data/alerted.json
+server/data/live-orders.json

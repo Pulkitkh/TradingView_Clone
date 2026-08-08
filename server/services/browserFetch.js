@@ -61,9 +61,24 @@ function clearCooldown(site) {
 // ---- browser fallback -------------------------------------------------------
 
 let ctxPromise = null;
+let browserRef = null;
 let browserUnavailableReason = null;
 let warnedUnavailable = false;
 const sitePages = {}; // site -> Promise<page>
+
+/**
+ * Close the browser and forget every warmed page, so the next fetch starts a
+ * fresh one. Chromium's memory creeps over days of uptime, and a stale profile
+ * can also accumulate cookies the exchanges dislike — a periodic recycle keeps
+ * a long-running process healthy.
+ */
+export async function recycleBrowser() {
+  const old = browserRef;
+  ctxPromise = null;
+  browserRef = null;
+  for (const k of Object.keys(sitePages)) delete sitePages[k];
+  if (old) await old.close().catch(() => {});
+}
 
 async function getContext() {
   if (ctxPromise) return ctxPromise;
@@ -88,6 +103,7 @@ async function getContext() {
     if (proxy) launchOpts.proxy = { server: proxy };
     try {
       const browser = await chromium.launch(launchOpts);
+      browserRef = browser;
       return await browser.newContext({ userAgent: UA });
     } catch (err) {
       browserUnavailableReason =

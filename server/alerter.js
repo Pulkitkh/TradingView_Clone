@@ -29,6 +29,8 @@ import { fetchOrderFilings as fetchBseOrders } from './services/bse.js';
 import { pdfTextFromUrl } from './services/pdf.js';
 import { extractOrder } from './services/extract.js';
 import { getAnnualRevenue } from './services/screener.js';
+import { recycleBrowser } from './services/browserFetch.js';
+import { log } from './services/logger.js';
 import * as dedupe from './services/alertDedupe.js';
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -39,6 +41,14 @@ const SEND_BACKLOG = process.env.ALERT_BACKLOG === 'true';
 const BSE_ENABLED = process.env.DISABLE_BSE !== 'true';
 const MIN_VALUE_CR = Number(process.env.ALERT_MIN_VALUE_CR || 0); // 0 = alert everything
 const MAX_PER_POLL = Number(process.env.ALERT_MAX_PER_POLL || 15); // flood guard; 0 = unlimited
+// 24/7 hardening
+const RECYCLE_AFTER_FAILURES = Number(process.env.ALERT_RECYCLE_AFTER_FAILURES || 3);
+const RECYCLE_EVERY_MS = Number(process.env.ALERT_RECYCLE_EVERY_MS || 6 * 3600_000); // 6h
+const HEARTBEAT_MS = Number(process.env.ALERT_HEARTBEAT_MS || 0); // 0 = off
+// Post the newest order once at startup, so a fresh launch visibly proves the
+// pipeline works instead of sitting silent until the next filing.
+const POST_LAST_ON_START = process.env.ALERT_POST_LAST_ON_START === 'true';
+const startedAt = Date.now();
 
 let firstRun = true;
 let running = true;
@@ -130,7 +140,7 @@ async function sendMessage(text) {
       } catch {
         /* default */
       }
-      console.warn(`[telegram] rate limited, waiting ${retryAfter}s`);
+      log.warn(`[telegram] rate limited, waiting ${retryAfter}s`);
       await new Promise((r) => setTimeout(r, (retryAfter + 1) * 1000));
       continue;
     }
@@ -289,7 +299,7 @@ async function baselineSilently() {
       n++;
     }
   } catch (err) {
-    console.warn('[alerter] NSE baseline:', err.message);
+    log.warn('[alerter] NSE baseline:', err.message);
   }
   if (BSE_ENABLED) {
     try {
@@ -302,7 +312,7 @@ async function baselineSilently() {
         n++;
       }
     } catch (err) {
-      console.warn('[alerter] BSE baseline:', err.message);
+      log.warn('[alerter] BSE baseline:', err.message);
     }
   }
   await dedupe.save();
@@ -316,7 +326,7 @@ async function pollOnce() {
   if (firstRun && !SEND_BACKLOG) {
     firstRun = false;
     const n = await baselineSilently();
-    console.log(
+    log.info(
       `[alerter] baselined ${n} existing filings silently ` +
         `(set ALERT_BACKLOG=true to post them). Now watching for new orders.`
     );
@@ -328,13 +338,13 @@ async function pollOnce() {
   try {
     collected.push(...(await collectNse()));
   } catch (err) {
-    console.warn('[alerter] NSE:', err.message);
+    log.warn('[alerter] NSE:', err.message);
   }
   if (BSE_ENABLED) {
     try {
       collected.push(...(await collectBse()));
     } catch (err) {
-      console.warn('[alerter] BSE:', err.message);
+      log.warn('[alerter] BSE:', err.message);
     }
   }
 
@@ -346,7 +356,7 @@ async function pollOnce() {
   // cap how many messages one cycle can post to the group.
   const batch = MAX_PER_POLL > 0 ? collected.slice(0, MAX_PER_POLL) : collected;
   if (batch.length < collected.length) {
-    console.warn(
+    log.warn(
       `[alerter] ${collected.length} new orders this poll — posting ${batch.length}, rest next cycle`
     );
   }
@@ -366,13 +376,13 @@ async function pollOnce() {
       await sendMessage(formatAlert(o));
       dedupe.markAlerted(o);
       stats.sent++;
-      console.log(
+      log.info(
         `[sent] (${o.source}) ${o.company} — ${o.contractValueCr ?? '?'} Cr — ${o.customer ?? '?'}`
       );
     } catch (err) {
       dedupe.release(raw); // let a later poll retry it
       stats.failed++;
-      console.warn(`[alerter] send failed for ${raw.company}: ${err.message}`);
+      log.warn(`[alerter] send failed for ${raw.company}: ${err.message}`);
     }
   }
   await dedupe.save();
@@ -383,17 +393,17 @@ async function pollOnce() {
 //                    (proves the whole pipeline end to end)
 async function runOneShot(mode, n) {
   if (mode === 'test') {
-    console.log('[alerter] sending test message…');
+    log.info('[alerter] sending test message…');
     await sendMessage(
       '✅ <b>Order alerter connected</b>\n' +
         '<i>If you can see this, the bot, token and group are set up correctly.</i>\n\n' +
         'Real alerts will arrive here as soon as a company files a new order with NSE or BSE.'
     );
-    console.log('[alerter] ✅ sent. Check your Telegram group.');
+    log.info('[alerter] ✅ sent. Check your Telegram group.');
     return;
   }
 
-  console.log(`[alerter] fetching the ${n} most recent orders…`);
+  log.info(`[alerter] fetching the ${n} most recent orders…`);
   await dedupe.init();
   // Deliberately ignore de-dupe here: this mode exists to prove the pipeline,
   // so it re-posts the newest N even though they are already recorded.
@@ -402,45 +412,94 @@ async function runOneShot(mode, n) {
   try {
     collected.push(...(await collectNse(opts)));
   } catch (err) {
-    console.warn('[alerter] NSE:', err.message);
+    log.warn('[alerter] NSE:', err.message);
   }
   if (BSE_ENABLED) {
     try {
       collected.push(...(await collectBse(opts)));
     } catch (err) {
-      console.warn('[alerter] BSE:', err.message);
+      log.warn('[alerter] BSE:', err.message);
     }
   }
   collected.sort((a, b) => new Date(b.date) - new Date(a.date)); // newest first
   const batch = collected.slice(0, n).reverse(); // post oldest-first
   if (!batch.length) {
-    console.log('[alerter] no orders found to send (feeds returned nothing new).');
+    log.info('[alerter] no orders found to send (feeds returned nothing new).');
     return;
   }
   for (const raw of batch) {
     const o = await enrich(raw);
     await sendMessage(formatAlert(o));
     dedupe.markAlerted(o); // so the live loop won't repeat them
-    console.log(`[sent] (${o.source}) ${o.company} — ${o.contractValueCr ?? '?'} Cr`);
+    log.info(`[sent] (${o.source}) ${o.company} — ${o.contractValueCr ?? '?'} Cr`);
   }
   await dedupe.save();
-  console.log(`[alerter] ✅ sent ${batch.length}. Check your Telegram group.`);
+  log.info(`[alerter] ✅ sent ${batch.length}. Check your Telegram group.`);
 }
 
 async function main() {
   const loaded = await dedupe.init();
-  console.log(
+  log.info(
     `[alerter] starting — NSE${BSE_ENABLED ? ' + BSE' : ''}, poll ${POLL_MS}ms, ` +
       `dedupe loaded ${loaded.ids} ids / ${loaded.prints} fingerprints`
   );
+  log.info(`[alerter] logging to ${log.file}`);
   if (loaded.ids > 0) firstRun = false; // returning run: alert anything genuinely new
 
+  if (POST_LAST_ON_START) {
+    try {
+      log.info('[alerter] posting the most recent order to confirm the pipeline…');
+      await runOneShot('recent', 1);
+    } catch (err) {
+      log.warn('[alerter] startup post failed (continuing anyway):', err.message);
+    }
+  }
+
+  let consecutiveFailures = 0;
+  let lastRecycle = Date.now();
+  let lastHeartbeat = Date.now();
+
   while (running) {
+    const before = stats.failed;
     try {
       await pollOnce();
+      // A poll that reached the feeds resets the failure counter.
+      consecutiveFailures = stats.failed > before ? consecutiveFailures : 0;
+      stats.lastOkAt = new Date().toISOString();
     } catch (err) {
-      console.error('[alerter] poll error:', err.message);
+      consecutiveFailures++;
+      log.error(`[alerter] poll error (${consecutiveFailures} in a row):`, err.message);
     }
+
+    // Repeated failures usually mean a wedged browser session or expired
+    // cookies. Recycle it rather than sitting broken until someone notices.
+    if (consecutiveFailures >= RECYCLE_AFTER_FAILURES) {
+      log.warn('[alerter] recycling browser after repeated failures');
+      await recycleBrowser().catch(() => {});
+      consecutiveFailures = 0;
+    }
+
+    // Scheduled recycle: Chromium's memory creeps over days of uptime.
+    if (RECYCLE_EVERY_MS > 0 && Date.now() - lastRecycle > RECYCLE_EVERY_MS) {
+      log.info('[alerter] scheduled browser recycle');
+      await recycleBrowser().catch(() => {});
+      lastRecycle = Date.now();
+    }
+
+    // Optional heartbeat so you can tell "quiet market" from "process died".
+    if (HEARTBEAT_MS > 0 && Date.now() - lastHeartbeat > HEARTBEAT_MS) {
+      lastHeartbeat = Date.now();
+      const up = Math.round((Date.now() - startedAt) / 3600000);
+      try {
+        await sendMessage(
+          `💓 <b>Alerter healthy</b>\n<i>up ${up}h • ${stats.sent} alerts sent • ` +
+            `${stats.polls} checks • last check ${esc(fmtDateTime(stats.lastPollAt))} IST</i>`
+        );
+      } catch (err) {
+        log.warn('[alerter] heartbeat failed:', err.message);
+      }
+    }
+
     await new Promise((r) => setTimeout(r, POLL_MS));
   }
 }
@@ -456,9 +515,7 @@ if (isEntry) {
 
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, async () => {
-      console.log(
-        `\n[alerter] ${sig} — saving state (sent ${stats.sent}, skipped ${stats.skipped})`
-      );
+      log.info(`[alerter] ${sig} — saving state (sent ${stats.sent}, skipped ${stats.skipped})`);
       running = false;
       try {
         await dedupe.save();
@@ -468,6 +525,16 @@ if (isEntry) {
       process.exit(0);
     });
   }
+
+  // On an unattended box an unexpected throw must not end a 24/7 run. Log it,
+  // keep the loop alive, and let the launcher restart us only if the process
+  // genuinely dies.
+  process.on('unhandledRejection', (err) => {
+    log.error('[alerter] unhandled rejection:', err?.message || String(err));
+  });
+  process.on('uncaughtException', (err) => {
+    log.error('[alerter] uncaught exception:', err?.message || String(err));
+  });
 
   const argv = process.argv.slice(2);
   const recentArg = argv.find((a) => a.startsWith('--send-recent'));
@@ -479,7 +546,7 @@ if (isEntry) {
 
   const run = oneShot ? runOneShot(oneShot.mode, oneShot.n) : main();
   run.catch((err) => {
-    console.error('[alerter] fatal:', err.message || err);
+    log.error('[alerter] fatal:', err.message || err);
     process.exit(1);
   });
 }
