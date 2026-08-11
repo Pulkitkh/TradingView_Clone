@@ -35,7 +35,12 @@ import * as dedupe from './services/alertDedupe.js';
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const POLL_MS = Number(process.env.ALERT_POLL_MS || process.env.POLL_INTERVAL_MS || 60_000);
+// 2 minutes by default: NSE rate-limits datacenter/VPS IPs (the usual RDP case)
+// aggressively, and polling harder mostly buys longer blocks. Filings still
+// arrive within a couple of minutes of being published.
+const POLL_MS = Number(process.env.ALERT_POLL_MS || process.env.POLL_INTERVAL_MS || 120_000);
+// Spread requests so we never hit the feeds on a perfectly predictable beat.
+const POLL_JITTER_MS = Number(process.env.ALERT_POLL_JITTER_MS || 15_000);
 const SEND_GAP_MS = Number(process.env.ALERT_SEND_GAP_MS || 3500); // Telegram: ~20 msg/min/group
 const SEND_BACKLOG = process.env.ALERT_BACKLOG === 'true';
 const BSE_ENABLED = process.env.DISABLE_BSE !== 'true';
@@ -500,7 +505,7 @@ async function main() {
       }
     }
 
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    await new Promise((r) => setTimeout(r, POLL_MS + Math.random() * POLL_JITTER_MS));
   }
 }
 

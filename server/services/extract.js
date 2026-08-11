@@ -49,6 +49,12 @@ const STRONG_ORDER_RE =
 const AMOUNT_RE =
   /(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)\s*(crores?|cr\.?|lakhs?|millions?|mn|billions?|bn)\b/i;
 
+// Plain rupee amounts with no unit word, which BSE headlines use constantly:
+//   "work order of Rs. 19,78,77,660/-"   "₹1,25,00,000"
+// Indian digit grouping (2,2,3) as well as western (3,3,3). Requires at least
+// 6 digits so we never read a document number or a year as money.
+const PLAIN_RUPEE_RE = /(?:rs\.?|inr|₹)\s*((?:\d{1,3}(?:,\d{2,3})+|\d{6,})(?:\.\d+)?)\s*(?!\s*(?:crores?|cr\b|lakhs?|millions?|mn|billions?|bn))/i;
+
 const ORDER_TYPE_RE =
   /(letter of intent|letter of acceptance|letter of award|work order|purchase order|supply order|epc contract|turnkey contract|work contract|contract|order)/i;
 
@@ -73,8 +79,17 @@ function titleCase(s) {
 export function parseHeadline({ headline, text }) {
   const blob = `${headline || ''}\n${text || ''}`;
 
+  // Prefer an amount that states its unit; fall back to a plain rupee figure
+  // (BSE headlines usually write the full number instead of "crore").
   const amt = blob.match(AMOUNT_RE);
-  const contractValueCr = amt ? toCrore(amt[1], amt[2]) : null;
+  let contractValueCr = amt ? toCrore(amt[1], amt[2]) : null;
+  if (contractValueCr == null) {
+    const plain = blob.match(PLAIN_RUPEE_RE);
+    if (plain) {
+      const rupees = parseFloat(plain[1].replace(/,/g, ''));
+      if (!Number.isNaN(rupees)) contractValueCr = +(rupees / 1e7).toFixed(2);
+    }
+  }
 
   const dur = blob.match(/(\d+)\s*(months?|years?|weeks?|days?)/i);
   const duration = dur ? `${dur[1]} ${dur[2].toLowerCase()}` : null;

@@ -12,7 +12,15 @@ export async function downloadPdf(url) {
 export async function extractText(buffer) {
   try {
     const result = await pdfParse(buffer);
-    return (result.text || '').replace(/ /g, '').trim();
+    // Normalise the odd spacing PDFs produce — non-breaking/zero-width spaces
+    // and runs of whitespace — WITHOUT deleting ordinary spaces, or the text
+    // collapses into unsearchable soup ("BEMLSoudha", "Rs.19crore").
+    return (result.text || '')
+      .replace(/[   ]/g, ' ')
+      .replace(/[​-‍﻿]/g, '')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   } catch {
     return '';
   }

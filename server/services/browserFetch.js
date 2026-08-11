@@ -147,6 +147,25 @@ async function getSitePage(site) {
   return sitePages[site];
 }
 
+/**
+ * Real browser cookies for a site, as a Cookie header. A plain request from a
+ * datacenter/VPS IP is often refused outright, so it never receives the session
+ * cookie the API requires; the browser passes the bot challenge and we can then
+ * reuse its cookies for cheap plain requests.
+ */
+export async function cookiesViaBrowser(site) {
+  try {
+    const page = await getSitePage(site);
+    if (!page) return null;
+    const ctx = await getContext();
+    const cookies = await ctx.cookies(SITE_HOME[site]);
+    if (!cookies?.length) return null;
+    return cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+  } catch {
+    return null;
+  }
+}
+
 async function inPageFetchOnce(site, url) {
   const page = await getSitePage(site);
   if (!page) return null;

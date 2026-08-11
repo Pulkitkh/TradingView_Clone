@@ -8,7 +8,7 @@
 //
 // (Endpoint + taxonomy identified from a working poller script. Thanks!)
 
-import { fetchJson, fetchText } from './browserFetch.js';
+import { fetchJson, fetchText, cookiesViaBrowser } from './browserFetch.js';
 
 // NSE merged the dedicated "award" event into Para B of Schedule III effective
 // 20-Jun-2026. The legacy `type=award` feed now returns 0 records (verified
@@ -45,6 +45,10 @@ const DATE_TAGS = [
 let cookie = '';
 let cookieAt = 0;
 
+// Ask NSE's home page for a session cookie. On a datacenter/VPS IP the plain
+// request is itself refused, so nothing is learned and the API call then fails
+// too — hence the browser fallback, which passes the bot challenge and can hand
+// us real cookies.
 async function warmup() {
   if (cookie && Date.now() - cookieAt < 1000 * 60 * 5) return;
   try {
@@ -62,9 +66,16 @@ async function warmup() {
         .map((c) => c.split(';')[0].trim())
         .join('; ');
       cookieAt = Date.now();
+      return;
     }
   } catch {
-    /* best effort */
+    /* fall through to the browser */
+  }
+
+  const viaBrowser = await cookiesViaBrowser('nse');
+  if (viaBrowser) {
+    cookie = viaBrowser;
+    cookieAt = Date.now();
   }
 }
 
