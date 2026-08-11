@@ -324,6 +324,33 @@ async function baselineSilently() {
   return n;
 }
 
+// An exchange being unreachable is an expected, self-healing condition — the
+// exchanges rate-limit datacenter/VPS ranges routinely. Log the transition into
+// and out of an outage, not every single poll, so the log stays readable and a
+// genuine problem is still visible.
+const sourceState = {}; // name -> { down: boolean, since: number, polls: number }
+
+function noteSourceFailed(name, message) {
+  const s = (sourceState[name] ||= { down: false, since: 0, polls: 0 });
+  s.polls++;
+  if (!s.down) {
+    s.down = true;
+    s.since = Date.now();
+    s.polls = 1;
+    log.warn(`[alerter] ${name} unreachable — retrying quietly. Reason: ${message}`);
+  }
+}
+
+function noteSourceOk(name) {
+  const s = (sourceState[name] ||= { down: false, since: 0, polls: 0 });
+  if (s.down) {
+    const mins = Math.max(1, Math.round((Date.now() - s.since) / 60000));
+    log.info(`[alerter] ${name} recovered after ${mins} min (${s.polls} retries)`);
+  }
+  s.down = false;
+  s.polls = 0;
+}
+
 async function pollOnce() {
   stats.polls++;
   stats.lastPollAt = new Date().toISOString();
@@ -342,14 +369,16 @@ async function pollOnce() {
   const collected = [];
   try {
     collected.push(...(await collectNse()));
+    noteSourceOk('NSE');
   } catch (err) {
-    log.warn('[alerter] NSE:', err.message);
+    noteSourceFailed('NSE', err.message);
   }
   if (BSE_ENABLED) {
     try {
       collected.push(...(await collectBse()));
+      noteSourceOk('BSE');
     } catch (err) {
-      log.warn('[alerter] BSE:', err.message);
+      noteSourceFailed('BSE', err.message);
     }
   }
 

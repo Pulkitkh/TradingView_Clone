@@ -100,6 +100,10 @@ export async function fetchOrderFilings() {
     try {
       data = await fetchJson(FEED(type), { cookie, headers });
     } catch (err) {
+      // Drop the cached cookie: if NSE soured on this session, replaying the
+      // same cookie next minute just re-triggers the block.
+      cookie = '';
+      cookieAt = 0;
       errors.push(`${type}: ${err.message}`);
       continue; // one feed failing shouldn't kill the other
     }

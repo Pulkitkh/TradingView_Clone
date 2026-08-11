@@ -42,20 +42,30 @@ function inCooldown(site) {
   return site && blockedUntil[site] && Date.now() < blockedUntil[site];
 }
 
+// Consecutive blocks back off progressively (1x, 2x, 4x… capped), because
+// retrying a rate-limited exchange on a fixed short beat keeps the block alive.
+const COOLDOWN_MAX_MS = Number(process.env.FETCH_COOLDOWN_MAX_MS || 15 * 60_000);
+const blockStreak = {};
+
 function startCooldown(site) {
-  if (!site) return;
-  if (!inCooldown(site)) {
-    blockedUntil[site] = Date.now() + COOLDOWN_MS;
+  if (!site || inCooldown(site)) return;
+  const streak = (blockStreak[site] = (blockStreak[site] || 0) + 1);
+  const wait = Math.min(COOLDOWN_MS * 2 ** (streak - 1), COOLDOWN_MAX_MS);
+  blockedUntil[site] = Date.now() + wait;
+  // Only announce the first block of a streak; the rest are the same story.
+  if (streak === 1) {
     console.warn(
-      `[fetch] ${site.toUpperCase()} is refusing requests — pausing ${Math.round(
-        COOLDOWN_MS / 1000
-      )}s before retrying (rate limit).`
+      `[fetch] ${site.toUpperCase()} is rate-limiting us — backing off (up to ${Math.round(
+        COOLDOWN_MAX_MS / 60000
+      )} min). This is normal and recovers on its own.`
     );
   }
 }
 
 function clearCooldown(site) {
-  if (site) delete blockedUntil[site];
+  if (!site) return;
+  delete blockedUntil[site];
+  blockStreak[site] = 0;
 }
 
 // ---- browser fallback -------------------------------------------------------
@@ -221,6 +231,20 @@ async function viaBrowser(url, { binary = false } = {}) {
   if (!binary && site) {
     const body = await inPageFetch(site, url);
     if (body != null) return body;
+  }
+  const top = await topLevelFetch(url, binary);
+  if (top != null) return top;
+
+  // Last resort: throw the whole browser away and try once with a genuinely
+  // fresh session. Re-warming a page reuses the same cookie jar, so once the
+  // exchange sours on that session every retry inside it fails too — which is
+  // exactly the "works once, then 403s forever" pattern on datacenter IPs.
+  if (!site) return null;
+  await recycleBrowser().catch(() => {});
+  await new Promise((r) => setTimeout(r, 1500));
+  if (!binary) {
+    const retry = await inPageFetch(site, url);
+    if (retry != null) return retry;
   }
   return topLevelFetch(url, binary);
 }
