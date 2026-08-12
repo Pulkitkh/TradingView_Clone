@@ -53,6 +53,11 @@ const HEARTBEAT_MS = Number(process.env.ALERT_HEARTBEAT_MS || 0); // 0 = off
 // Post the newest order once at startup, so a fresh launch visibly proves the
 // pipeline works instead of sitting silent until the next filing.
 const POST_LAST_ON_START = process.env.ALERT_POST_LAST_ON_START === 'true';
+// Hard age cutoff. The exchange feeds carry ~a month of filings, so if the
+// de-dupe state is ever lost (fresh copy of the folder, deleted data file) the
+// whole backlog looks new and floods the group. Age is an independent guard:
+// a filing older than this is never alerted, whatever the state says.
+const MAX_AGE_MIN = Number(process.env.ALERT_MAX_AGE_MIN || 180);
 const startedAt = Date.now();
 
 let firstRun = true;
@@ -177,6 +182,14 @@ function parseDate(s) {
   return new Date().toISOString();
 }
 
+/** True if a raw feed timestamp is older than the alerting cutoff. */
+function isTooOld(rawDate) {
+  if (MAX_AGE_MIN <= 0 || !rawDate) return false;
+  const t = new Date(parseDate(rawDate)).getTime();
+  if (Number.isNaN(t)) return false;
+  return t < Date.now() - MAX_AGE_MIN * 60_000;
+}
+
 // ---------- collect orders from both exchanges ----------
 
 // `limit` + `ignoreDedupe` exist for --send-recent, which deliberately re-posts
@@ -190,10 +203,11 @@ async function collectNse({ ignoreDedupe = false, limit = 0 } = {}) {
   }
   for (const rec of feed) {
     const filing = normalizeFeed(rec);
-    // Cheap id check BEFORE fetching the XBRL — avoids re-downloading documents
-    // for filings we've already alerted on.
+    // Cheap id + age checks BEFORE fetching the XBRL — avoids downloading
+    // hundreds of documents for filings we will not post anyway.
     if (!ignoreDedupe && dedupe.alreadyAlerted({ id: filing.id, company: filing.company }))
       continue;
+    if (!ignoreDedupe && isTooOld(filing.broadcastDateTime)) continue;
 
     let x = {};
     if (filing.xbrlUrl) {
@@ -245,6 +259,7 @@ async function collectBse({ ignoreDedupe = false, limit = 0 } = {}) {
   for (const filing of feed) {
     if (!ignoreDedupe && dedupe.alreadyAlerted({ id: filing.id, company: filing.company }))
       continue;
+    if (!ignoreDedupe && isTooOld(filing.broadcastDateTime)) continue;
     const getPdf = filing.pdfUrl ? () => pdfTextFromUrl(filing.pdfUrl).catch(() => '') : null;
     const ex = await extractOrder(
       { company: filing.company, headline: filing.headline, category: filing.category, text: '' },
@@ -380,6 +395,29 @@ async function pollOnce() {
     } catch (err) {
       noteSourceFailed('BSE', err.message);
     }
+  }
+
+  // Drop anything older than the cutoff and record it, so it is never
+  // reconsidered. This is what keeps a lost state file from replaying weeks of
+  // filings into the group.
+  if (MAX_AGE_MIN > 0) {
+    const oldest = Date.now() - MAX_AGE_MIN * 60_000;
+    const fresh = [];
+    let stale = 0;
+    for (const o of collected) {
+      if (new Date(o.date).getTime() < oldest) {
+        dedupe.markSeenSilently(o);
+        stale++;
+      } else {
+        fresh.push(o);
+      }
+    }
+    if (stale) {
+      log.info(`[alerter] ignored ${stale} filing(s) older than ${MAX_AGE_MIN} min`);
+      await dedupe.save();
+    }
+    collected.length = 0;
+    collected.push(...fresh);
   }
 
   // Oldest first, so the group reads chronologically.
